@@ -1,12 +1,14 @@
 // ==WindhawkMod==
 // @id              transparent-screensaver-fix
 // @name            Transparent Screensaver Fix
-// @description     Allows transparent screensavers to see your desktop again
-// @version         1.0.0
+// @description     Allows transparent screensavers to see your desktop again, live
+// @version         1.1.0
 // @author          aubymori
 // @github          https://github.com/aubymori
 // @include         winlogon.exe
+// @include         Bubbles.scr
 // @architecture    x86-64
+// @compilerOptions -lgdi32
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -14,6 +16,11 @@
 # Transparent Screensaver Fix
 This mod allows transparent screensavers, such as the Bubbles screensaver, to see
 your desktop again, rather than displaying a solid color.
+
+With **Live desktop feed** enabled, the Bubbles screensaver keeps refreshing the
+desktop behind the bubbles instead of showing a snapshot taken when it started.
+This requires Windows 10 version 2004 or later. The small preview in the Screen
+Saver Settings dialog stays static.
 
 # IMPORTANT: READ!
 Windhawk needs to hook into `winlogon.exe` for this mod to work. Please navigate
@@ -30,7 +37,31 @@ that `winlogon.exe` is in the Process inclusion list.
 */
 // ==/WindhawkModReadme==
 
+// ==WindhawkModSettings==
+/*
+- liveFeed: true
+  $name: Live desktop feed
+  $description: Continuously refresh the desktop behind the Bubbles screensaver instead of using a static snapshot
+- fps: 24
+  $name: Live feed frame rate
+  $description: How many times per second the desktop is captured (1-120)
+*/
+// ==/WindhawkModSettings==
+
 #include <windhawk_utils.h>
+#include <d3d9.h>
+#include <algorithm>
+#include <atomic>
+#include <memory>
+#include <vector>
+
+#ifndef WDA_EXCLUDEFROMCAPTURE
+#define WDA_EXCLUDEFROMCAPTURE 0x00000011
+#endif
+
+/*
+ * winlogon.exe: run the screensaver on the user desktop
+ */
 
 bool g_bStartingScreenSaver = false;
 
@@ -113,17 +144,480 @@ const WindhawkUtils::SYMBOL_HOOK winlogonExeHooks[] = {
     }
 };
 
-BOOL Wh_ModInit(void)
+/*
+ * Bubbles.scr: live desktop feed
+ *
+ * At startup, MonitorEnumProc BitBlts each monitor into an in-memory TGA, which
+ * RestoreDeviceObjects turns into the texture drawn behind (and refracted by)
+ * the bubbles. We remember which texture belongs to which monitor, capture the
+ * monitors on a worker thread, and upload the newest frame before each render.
+ * The screensaver windows are excluded from capture so they don't film themselves.
+ */
+
+struct MonitorCapture
 {
-    if (!WindhawkUtils::HookSymbols(
-        GetModuleHandleW(NULL),
-        winlogonExeHooks,
-        ARRAYSIZE(winlogonExeHooks)
-    ))
+    RECT               rc;
+    const BYTE        *tgaData;               // Bubbles' own snapshot of this monitor
+    HDC                hdc  = nullptr;        // Top-down 32bpp DIB, owned by the capture thread
+    HBITMAP            hbm  = nullptr;
+    const BYTE        *bits = nullptr;
+    SRWLOCK            lock = SRWLOCK_INIT;   // Shared while reading bits, exclusive to free them
+
+    // Single-buffer handoff: a frame is only captured once the previous one has
+    // been uploaded, so the two threads never touch the pixels at the same time,
+    // and nothing is captured while nobody renders.
+    std::atomic<ULONG> seq{0};                // Last frame captured
+    std::atomic<ULONG> consumed{0};           // Last frame uploaded
+};
+
+struct LiveTexture
+{
+    UINT               renderUnit;
+    IDirect3DDevice9  *pDevice;
+    IDirect3DTexture9 *pTexture;              // Owned by Bubbles
+    IDirect3DTexture9 *pStaging;              // Ours, D3DPOOL_SYSTEMMEM
+    MonitorCapture    *pCapture;
+};
+
+bool g_bLiveFeed;
+int  g_fps;
+
+// Appended on the render thread, walked by the capture thread. One entry per
+// monitor, kept for the process lifetime; their DIBs die with the capture thread.
+SRWLOCK                                      g_capturesLock = SRWLOCK_INIT;
+std::vector<std::unique_ptr<MonitorCapture>> g_captures;
+
+// Render thread only
+std::vector<LiveTexture> g_liveTextures;
+UINT                     g_currentRenderUnit = 0;
+const RECT              *g_pEnumMonitorRect = nullptr;
+bool                     g_bExcludedFromCapture = false;
+
+HANDLE g_hCaptureThread = nullptr;
+HANDLE g_hStopEvent = nullptr;
+
+LONG Width(const RECT &rc)  { return rc.right - rc.left; }
+LONG Height(const RECT &rc) { return rc.bottom - rc.top; }
+
+bool CreateCaptureBuffer(MonitorCapture *pCap)
+{
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
+    bmi.bmiHeader.biWidth = Width(pCap->rc);
+    bmi.bmiHeader.biHeight = -Height(pCap->rc);  // Top-down, like the texture
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+
+    void *pBits;
+    pCap->hdc = CreateCompatibleDC(nullptr);
+    pCap->hbm = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+    if (!pCap->hdc || !pCap->hbm)
+        return false;
+    SelectObject(pCap->hdc, pCap->hbm);
+    pCap->bits = (const BYTE *)pBits;
+    return true;
+}
+
+void DestroyCaptureBuffer(MonitorCapture *pCap)
+{
+    AcquireSRWLockExclusive(&pCap->lock);
+    if (pCap->hdc)
+        DeleteDC(pCap->hdc);  // Deselects the bitmap so it can be deleted
+    if (pCap->hbm)
+        DeleteObject(pCap->hbm);
+    pCap->hdc = nullptr;
+    pCap->hbm = nullptr;
+    pCap->bits = nullptr;
+    ReleaseSRWLockExclusive(&pCap->lock);
+}
+
+/* Periodic timer; high resolution avoids the ~16 ms jitter of the default timer */
+HANDLE CreateFrameTimer(LONG periodMs)
+{
+    LARGE_INTEGER due;
+    due.QuadPart = -1;
+    for (DWORD flags : { (DWORD)CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, 0UL })
     {
-        Wh_Log(L"Failed to hook one or more symbol functions in winlogon.exe");
-        return FALSE;
+        HANDLE hTimer = CreateWaitableTimerExW(nullptr, nullptr, flags, TIMER_ALL_ACCESS);
+        if (hTimer && SetWaitableTimer(hTimer, &due, periodMs, nullptr, nullptr, FALSE))
+            return hTimer;
+        if (hTimer)
+            CloseHandle(hTimer);
+    }
+    return nullptr;
+}
+
+DWORD WINAPI CaptureThreadProc(LPVOID)
+{
+    HANDLE hTimer = CreateFrameTimer(1000 / g_fps);
+    if (!hTimer)
+        return 1;
+
+    HANDLE handles[] = { g_hStopEvent, hTimer };
+    HDC hdcScreen = nullptr;
+    while (WaitForMultipleObjects(ARRAYSIZE(handles), handles, FALSE, INFINITE) == WAIT_OBJECT_0 + 1)
+    {
+        if (!hdcScreen && !(hdcScreen = GetDC(nullptr)))
+            continue;
+
+        AcquireSRWLockShared(&g_capturesLock);
+        for (auto &pCap : g_captures)
+        {
+            if (pCap->seq != pCap->consumed)
+                continue;
+            if (!pCap->hdc && !CreateCaptureBuffer(pCap.get()))
+            {
+                DestroyCaptureBuffer(pCap.get());
+                continue;
+            }
+            if (!BitBlt(
+                pCap->hdc, 0, 0, Width(pCap->rc), Height(pCap->rc),
+                hdcScreen, pCap->rc.left, pCap->rc.top, SRCCOPY | CAPTUREBLT))
+            {
+                // The screen DC may have gone stale, get a fresh one next tick
+                ReleaseDC(nullptr, hdcScreen);
+                hdcScreen = nullptr;
+                break;
+            }
+            GdiFlush();
+            pCap->seq++;
+        }
+        ReleaseSRWLockShared(&g_capturesLock);
     }
 
+    if (hdcScreen)
+        ReleaseDC(nullptr, hdcScreen);
+    CloseHandle(hTimer);
+
+    AcquireSRWLockShared(&g_capturesLock);
+    for (auto &pCap : g_captures)
+        DestroyCaptureBuffer(pCap.get());
+    ReleaseSRWLockShared(&g_capturesLock);
+    return 0;
+}
+
+void StartCaptureThread(void)
+{
+    if (g_hCaptureThread)
+        return;
+    if (!g_hStopEvent)
+        g_hStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (g_hStopEvent)
+        g_hCaptureThread = CreateThread(nullptr, 0, CaptureThreadProc, nullptr, 0, nullptr);
+}
+
+void StopCaptureThread(void)
+{
+    if (g_hCaptureThread)
+    {
+        SetEvent(g_hStopEvent);
+        WaitForSingleObject(g_hCaptureThread, INFINITE);
+        CloseHandle(g_hCaptureThread);
+        g_hCaptureThread = nullptr;
+    }
+    if (g_hStopEvent)
+    {
+        CloseHandle(g_hStopEvent);
+        g_hStopEvent = nullptr;
+    }
+}
+
+/* Remove tracked textures and free their staging copies */
+template <typename Pred>
+void DropLiveTextures(Pred pred)
+{
+    std::erase_if(g_liveTextures, [&](LiveTexture &lt)
+    {
+        if (!pred(lt))
+            return false;
+        if (lt.pStaging)
+            lt.pStaging->Release();
+        return true;
+    });
+}
+
+/* Copy the newest captured frame of a monitor into its Bubbles texture */
+void UpdateLiveTexture(LiveTexture &lt)
+{
+    MonitorCapture *pCap = lt.pCapture;
+    ULONG seq = pCap->seq;
+    D3DSURFACE_DESC desc;
+    if (seq == pCap->consumed || FAILED(lt.pTexture->GetLevelDesc(0, &desc)))
+        return;
+
+    if (!lt.pStaging)
+    {
+        IDirect3DTexture9 *pStaging;
+        if (FAILED(lt.pDevice->CreateTexture(
+            desc.Width, desc.Height, 1, 0, desc.Format, D3DPOOL_SYSTEMMEM, &pStaging, nullptr)))
+            return;
+        lt.pStaging = pStaging;
+    }
+
+    D3DLOCKED_RECT lr;
+    if (FAILED(lt.pStaging->LockRect(0, &lr, nullptr, D3DLOCK_NOSYSLOCK)))
+        return;
+
+    // Same BGRA layout as the TGA Bubbles builds, straight from BitBlt
+    SIZE_T srcPitch = (SIZE_T)Width(pCap->rc) * 4;
+    SIZE_T rowBytes = (std::min)(srcPitch, (SIZE_T)desc.Width * 4);
+    UINT   rows     = (std::min)((UINT)Height(pCap->rc), desc.Height);
+
+    AcquireSRWLockShared(&pCap->lock);
+    const BYTE *src = pCap->bits;
+    if (src && (SIZE_T)lr.Pitch == srcPitch && rowBytes == srcPitch)
+    {
+        memcpy(lr.pBits, src, srcPitch * rows);
+    }
+    else if (src)
+    {
+        for (UINT y = 0; y < rows; y++)
+            memcpy((BYTE *)lr.pBits + (SIZE_T)y * lr.Pitch, src + y * srcPitch, rowBytes);
+    }
+    ReleaseSRWLockShared(&pCap->lock);
+    lt.pStaging->UnlockRect(0);
+
+    // Hand the buffer back to the capture thread
+    pCap->consumed = seq;
+    if (!src)
+        return;
+
+    IDirect3DSurface9 *pSrc, *pDst;
+    if (SUCCEEDED(lt.pStaging->GetSurfaceLevel(0, &pSrc)))
+    {
+        if (SUCCEEDED(lt.pTexture->GetSurfaceLevel(0, &pDst)))
+        {
+            if (SUCCEEDED(lt.pDevice->UpdateSurface(pSrc, nullptr, pDst, nullptr)))
+                lt.pTexture->GenerateMipSubLevels();
+            pDst->Release();
+        }
+        pSrc->Release();
+    }
+}
+
+/* Only the fullscreen saver windows; the Settings preview is a child window and never listed here */
+BOOL CALLBACK ExcludeSaverWindowFromCapture(HWND hwnd, LPARAM)
+{
+    WCHAR szClass[32];
+    if (GetClassNameW(hwnd, szClass, ARRAYSIZE(szClass))
+    && 0 == wcscmp(szClass, L"D3DSaverWndClass"))
+    {
+        if (SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE))
+            g_bExcludedFromCapture = true;
+        else
+            Wh_Log(L"SetWindowDisplayAffinity failed (%u), live feed disabled", GetLastError());
+    }
     return TRUE;
+}
+
+HRESULT (*CD3DScreensaver_CreateSaverWindow_orig)(void *);
+HRESULT CD3DScreensaver_CreateSaverWindow_hook(void *pThis)
+{
+    HRESULT hr = CD3DScreensaver_CreateSaverWindow_orig(pThis);
+    if (g_bLiveFeed)
+        EnumThreadWindows(GetCurrentThreadId(), ExcludeSaverWindowFromCapture, 0);
+    return hr;
+}
+
+/* Remember which monitor is being snapshotted */
+BOOL (*MonitorEnumProc_orig)(HMONITOR, HDC, LPRECT, LPARAM);
+BOOL MonitorEnumProc_hook(HMONITOR hMonitor, HDC hdc, LPRECT lprcMonitor, LPARAM dwData)
+{
+    g_pEnumMonitorRect = lprcMonitor;
+    BOOL result = MonitorEnumProc_orig(hMonitor, hdc, lprcMonitor, dwData);
+    g_pEnumMonitorRect = nullptr;
+    return result;
+}
+
+/* MonitorEnumProc reads the snapshot pixels right after the 18-byte TGA header */
+decltype(&GetDIBits) GetDIBits_orig;
+int WINAPI GetDIBits_hook(HDC hdc, HBITMAP hbm, UINT start, UINT cLines, LPVOID lpvBits, LPBITMAPINFO lpbmi, UINT usage)
+{
+    int result = GetDIBits_orig(hdc, hbm, start, cLines, lpvBits, lpbmi, usage);
+    if (g_pEnumMonitorRect && lpvBits && result)
+    {
+        const BYTE *tgaData = (const BYTE *)lpvBits - 18;
+
+        // A new snapshot of a known monitor only moves its TGA
+        for (auto &pCap : g_captures)
+        {
+            if (EqualRect(&pCap->rc, g_pEnumMonitorRect))
+            {
+                pCap->tgaData = tgaData;
+                return result;
+            }
+        }
+
+        auto pCap = std::make_unique<MonitorCapture>();
+        pCap->rc = *g_pEnumMonitorRect;
+        pCap->tgaData = tgaData;
+
+        AcquireSRWLockExclusive(&g_capturesLock);
+        g_captures.push_back(std::move(pCap));
+        ReleaseSRWLockExclusive(&g_capturesLock);
+    }
+    return result;
+}
+
+/* Track the textures created from the monitor snapshots */
+HRESULT (*Texture_CreateTextureFromTGAFileInMemory_orig)(IDirect3DDevice9 *, const BYTE *, UINT, UINT, DWORD, D3DFORMAT, IDirect3DTexture9 **);
+HRESULT Texture_CreateTextureFromTGAFileInMemory_hook(
+    IDirect3DDevice9   *pDevice,
+    const BYTE         *pData,
+    UINT                a3,
+    UINT                a4,
+    DWORD               a5,
+    D3DFORMAT           a6,
+    IDirect3DTexture9 **ppTexture
+)
+{
+    HRESULT hr = Texture_CreateTextureFromTGAFileInMemory_orig(
+        pDevice, pData, a3, a4, a5, a6, ppTexture
+    );
+    if (FAILED(hr) || !*ppTexture || !g_bLiveFeed || !g_bExcludedFromCapture)
+        return hr;
+
+    for (auto &pCap : g_captures)
+    {
+        if (pCap->tgaData == pData)
+        {
+            // Replaces any entry this render unit left behind without an Invalidate
+            DropLiveTextures([&](const LiveTexture &lt)
+            {
+                return lt.renderUnit == g_currentRenderUnit && lt.pCapture == pCap.get();
+            });
+            g_liveTextures.push_back({ g_currentRenderUnit, pDevice, *ppTexture, nullptr, pCap.get() });
+            StartCaptureThread();
+            break;
+        }
+    }
+    return hr;
+}
+
+/* Called by SwitchToRenderUnit with the render unit becoming current */
+void (*BubblesScreensaver_SetDevice_orig)(void *, UINT);
+void BubblesScreensaver_SetDevice_hook(void *pThis, UINT iDevice)
+{
+    g_currentRenderUnit = iDevice;
+    BubblesScreensaver_SetDevice_orig(pThis, iDevice);
+}
+
+/* The current render unit's textures are about to be released */
+HRESULT (*BubblesScreensaver_InvalidateDeviceObjects_orig)(void *);
+HRESULT BubblesScreensaver_InvalidateDeviceObjects_hook(void *pThis)
+{
+    DropLiveTextures([](const LiveTexture &lt)
+    {
+        return lt.renderUnit == g_currentRenderUnit;
+    });
+    return BubblesScreensaver_InvalidateDeviceObjects_orig(pThis);
+}
+
+/* Called once per frame, before every render unit is drawn */
+HRESULT (*CD3DScreensaver_Render3DEnvironment_orig)(void *);
+HRESULT CD3DScreensaver_Render3DEnvironment_hook(void *pThis)
+{
+    for (auto &lt : g_liveTextures)
+        UpdateLiveTexture(lt);
+    return CD3DScreensaver_Render3DEnvironment_orig(pThis);
+}
+
+const WindhawkUtils::SYMBOL_HOOK bubblesScrHooks[] = {
+    {
+        {
+            L"protected: long __cdecl CD3DScreensaver::CreateSaverWindow(void)"
+        },
+        &CD3DScreensaver_CreateSaverWindow_orig,
+        CD3DScreensaver_CreateSaverWindow_hook,
+        false
+    },
+    {
+        {
+            L"int __cdecl MonitorEnumProc(struct HMONITOR__ *,struct HDC__ *,struct tagRECT *,__int64)"
+        },
+        &MonitorEnumProc_orig,
+        MonitorEnumProc_hook,
+        false
+    },
+    {
+        {
+            L"long __cdecl Texture::CreateTextureFromTGAFileInMemory(struct IDirect3DDevice9 *,unsigned char const *,unsigned int,unsigned int,unsigned long,enum _D3DFORMAT,struct IDirect3DTexture9 * *)"
+        },
+        &Texture_CreateTextureFromTGAFileInMemory_orig,
+        Texture_CreateTextureFromTGAFileInMemory_hook,
+        false
+    },
+    {
+        {
+            L"public: virtual void __cdecl BubblesScreensaver::SetDevice(unsigned int)"
+        },
+        &BubblesScreensaver_SetDevice_orig,
+        BubblesScreensaver_SetDevice_hook,
+        false
+    },
+    {
+        {
+            L"public: virtual long __cdecl BubblesScreensaver::InvalidateDeviceObjects(void)"
+        },
+        &BubblesScreensaver_InvalidateDeviceObjects_orig,
+        BubblesScreensaver_InvalidateDeviceObjects_hook,
+        false
+    },
+    {
+        {
+            L"protected: long __cdecl CD3DScreensaver::Render3DEnvironment(void)"
+        },
+        &CD3DScreensaver_Render3DEnvironment_orig,
+        CD3DScreensaver_Render3DEnvironment_hook,
+        false
+    }
+};
+
+bool g_bIsWinlogon = false;
+
+void LoadSettings(void)
+{
+    g_bLiveFeed = Wh_GetIntSetting(L"liveFeed");
+    g_fps = std::clamp(Wh_GetIntSetting(L"fps"), 1, 120);
+}
+
+BOOL Wh_ModInit(void)
+{
+    g_bIsWinlogon = GetModuleHandleW(L"winlogon.exe") != nullptr;
+    if (g_bIsWinlogon)
+    {
+        if (!WindhawkUtils::HookSymbols(GetModuleHandleW(NULL), winlogonExeHooks, ARRAYSIZE(winlogonExeHooks)))
+        {
+            Wh_Log(L"Failed to hook one or more symbol functions in winlogon.exe");
+            return FALSE;
+        }
+        return TRUE;
+    }
+
+    LoadSettings();
+
+    if (!WindhawkUtils::HookSymbols(GetModuleHandleW(NULL), bubblesScrHooks, ARRAYSIZE(bubblesScrHooks)))
+    {
+        Wh_Log(L"Failed to hook one or more symbol functions in Bubbles.scr");
+        return FALSE;
+    }
+    if (!WindhawkUtils::SetFunctionHook(GetDIBits, GetDIBits_hook, &GetDIBits_orig))
+    {
+        Wh_Log(L"Failed to hook GetDIBits");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+void Wh_ModUninit(void)
+{
+    // Staging textures belong to the render thread's devices and are left to process exit
+    if (!g_bIsWinlogon)
+        StopCaptureThread();
+}
+
+void Wh_ModSettingsChanged(void)
+{
+    if (!g_bIsWinlogon)
+        LoadSettings();
 }
