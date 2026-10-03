@@ -52,7 +52,6 @@ that `winlogon.exe` is in the Process inclusion list.
 #include <d3d9.h>
 #include <algorithm>
 #include <atomic>
-#include <memory>
 #include <vector>
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
@@ -150,18 +149,27 @@ const WindhawkUtils::SYMBOL_HOOK winlogonExeHooks[] = {
  * At startup, MonitorEnumProc BitBlts each monitor into an in-memory TGA, which
  * RestoreDeviceObjects turns into the texture drawn behind (and refracted by)
  * the bubbles. We remember which texture belongs to which monitor, capture the
- * monitors on a worker thread, and upload the newest frame before each render.
+ * desktop on a worker thread, and upload the newest frame before each render.
  * The screensaver windows are excluded from capture so they don't film themselves.
  */
 
-struct MonitorCapture
+struct MonitorSnapshot
 {
-    RECT               rc;
-    const BYTE        *tgaData;               // Bubbles' own snapshot of this monitor
+    RECT        rc;
+    const BYTE *tgaData;                      // Bubbles' own snapshot of this monitor
+};
+
+/*
+ * Screen BitBlts mostly wait on DWM, so all monitors are captured with a single
+ * BitBlt of their bounding rect instead of one per monitor.
+ */
+struct DesktopCapture
+{
+    RECT               rc   = {};             // Bounding rect of all monitors, guarded by lock
     HDC                hdc  = nullptr;        // Top-down 32bpp DIB, owned by the capture thread
     HBITMAP            hbm  = nullptr;
     const BYTE        *bits = nullptr;
-    SRWLOCK            lock = SRWLOCK_INIT;   // Shared while reading bits, exclusive to free them
+    SRWLOCK            lock = SRWLOCK_INIT;   // Shared while reading, exclusive to (re)allocate
 
     // Single-buffer handoff: a frame is only captured once the previous one has
     // been uploaded, so the two threads never touch the pixels at the same time,
@@ -173,19 +181,20 @@ struct MonitorCapture
 struct LiveTexture
 {
     UINT               renderUnit;
+    RECT               rc;                    // Monitor shown by this texture
     IDirect3DDevice9  *pDevice;
     IDirect3DTexture9 *pTexture;              // Owned by Bubbles
     IDirect3DTexture9 *pStaging;              // Ours, D3DPOOL_SYSTEMMEM
-    MonitorCapture    *pCapture;
 };
 
 bool g_bLiveFeed;
 int  g_fps;
 
-// Appended on the render thread, walked by the capture thread. One entry per
-// monitor, kept for the process lifetime; their DIBs die with the capture thread.
-SRWLOCK                                      g_capturesLock = SRWLOCK_INIT;
-std::vector<std::unique_ptr<MonitorCapture>> g_captures;
+// Appended on the render thread, read by the capture thread
+SRWLOCK                      g_monitorsLock = SRWLOCK_INIT;
+std::vector<MonitorSnapshot> g_monitors;
+
+DesktopCapture g_capture;
 
 // Render thread only
 std::vector<LiveTexture> g_liveTextures;
@@ -195,40 +204,63 @@ bool                     g_bExcludedFromCapture = false;
 
 HANDLE g_hCaptureThread = nullptr;
 HANDLE g_hStopEvent = nullptr;
+HANDLE g_hUploadedEvent = nullptr;  // Signaled by the render thread, kept for the process lifetime
 
 LONG Width(const RECT &rc)  { return rc.right - rc.left; }
 LONG Height(const RECT &rc) { return rc.bottom - rc.top; }
 
-bool CreateCaptureBuffer(MonitorCapture *pCap)
+/* Caller holds g_capture.lock exclusively */
+void FreeCaptureBuffer(void)
 {
+    if (g_capture.hdc)
+        DeleteDC(g_capture.hdc);  // Deselects the bitmap so it can be deleted
+    if (g_capture.hbm)
+        DeleteObject(g_capture.hbm);
+    g_capture.hdc = nullptr;
+    g_capture.hbm = nullptr;
+    g_capture.bits = nullptr;
+    g_capture.rc = {};
+}
+
+/* (Re)allocates the capture buffer when the monitor layout changed */
+bool EnsureCaptureBuffer(void)
+{
+    RECT rc = {};
+    AcquireSRWLockShared(&g_monitorsLock);
+    for (const auto &monitor : g_monitors)
+        UnionRect(&rc, &rc, &monitor.rc);
+    ReleaseSRWLockShared(&g_monitorsLock);
+
+    if (g_capture.hdc && EqualRect(&rc, &g_capture.rc))
+        return true;
+    if (IsRectEmpty(&rc))
+        return false;
+
     BITMAPINFO bmi = {};
     bmi.bmiHeader.biSize = sizeof(bmi.bmiHeader);
-    bmi.bmiHeader.biWidth = Width(pCap->rc);
-    bmi.bmiHeader.biHeight = -Height(pCap->rc);  // Top-down, like the texture
+    bmi.bmiHeader.biWidth = Width(rc);
+    bmi.bmiHeader.biHeight = -Height(rc);  // Top-down, like the textures
     bmi.bmiHeader.biPlanes = 1;
     bmi.bmiHeader.biBitCount = 32;
 
+    AcquireSRWLockExclusive(&g_capture.lock);
+    FreeCaptureBuffer();
     void *pBits;
-    pCap->hdc = CreateCompatibleDC(nullptr);
-    pCap->hbm = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
-    if (!pCap->hdc || !pCap->hbm)
-        return false;
-    SelectObject(pCap->hdc, pCap->hbm);
-    pCap->bits = (const BYTE *)pBits;
-    return true;
-}
-
-void DestroyCaptureBuffer(MonitorCapture *pCap)
-{
-    AcquireSRWLockExclusive(&pCap->lock);
-    if (pCap->hdc)
-        DeleteDC(pCap->hdc);  // Deselects the bitmap so it can be deleted
-    if (pCap->hbm)
-        DeleteObject(pCap->hbm);
-    pCap->hdc = nullptr;
-    pCap->hbm = nullptr;
-    pCap->bits = nullptr;
-    ReleaseSRWLockExclusive(&pCap->lock);
+    g_capture.hdc = CreateCompatibleDC(nullptr);
+    g_capture.hbm = CreateDIBSection(nullptr, &bmi, DIB_RGB_COLORS, &pBits, nullptr, 0);
+    bool ok = g_capture.hdc && g_capture.hbm;
+    if (ok)
+    {
+        SelectObject(g_capture.hdc, g_capture.hbm);
+        g_capture.bits = (const BYTE *)pBits;
+        g_capture.rc = rc;
+    }
+    else
+    {
+        FreeCaptureBuffer();
+    }
+    ReleaseSRWLockExclusive(&g_capture.lock);
+    return ok;
 }
 
 /* Periodic timer; high resolution avoids the ~16 ms jitter of the default timer */
@@ -253,46 +285,46 @@ DWORD WINAPI CaptureThreadProc(LPVOID)
     if (!hTimer)
         return 1;
 
-    HANDLE handles[] = { g_hStopEvent, hTimer };
+    HANDLE tickHandles[] = { g_hStopEvent, hTimer };
+    HANDLE uploadHandles[] = { g_hStopEvent, g_hUploadedEvent };
     HDC hdcScreen = nullptr;
-    while (WaitForMultipleObjects(ARRAYSIZE(handles), handles, FALSE, INFINITE) == WAIT_OBJECT_0 + 1)
+    while (WaitForMultipleObjects(ARRAYSIZE(tickHandles), tickHandles, FALSE, INFINITE) == WAIT_OBJECT_0 + 1)
     {
+        // Wait for the previous frame to be uploaded instead of dropping the tick. Looping
+        // because the event can still be signaled from an earlier upload.
+        bool stop = false;
+        while (!stop && g_capture.seq != g_capture.consumed)
+            stop = WaitForMultipleObjects(ARRAYSIZE(uploadHandles), uploadHandles, FALSE, INFINITE) != WAIT_OBJECT_0 + 1;
+        if (stop)
+            break;
+
         if (!hdcScreen && !(hdcScreen = GetDC(nullptr)))
             continue;
+        if (!EnsureCaptureBuffer())
+            continue;
 
-        AcquireSRWLockShared(&g_capturesLock);
-        for (auto &pCap : g_captures)
+        // Only this thread changes the buffer, so it can be written without the lock
+        const RECT &rc = g_capture.rc;
+        if (!BitBlt(
+            g_capture.hdc, 0, 0, Width(rc), Height(rc),
+            hdcScreen, rc.left, rc.top, SRCCOPY | CAPTUREBLT))
         {
-            if (pCap->seq != pCap->consumed)
-                continue;
-            if (!pCap->hdc && !CreateCaptureBuffer(pCap.get()))
-            {
-                DestroyCaptureBuffer(pCap.get());
-                continue;
-            }
-            if (!BitBlt(
-                pCap->hdc, 0, 0, Width(pCap->rc), Height(pCap->rc),
-                hdcScreen, pCap->rc.left, pCap->rc.top, SRCCOPY | CAPTUREBLT))
-            {
-                // The screen DC may have gone stale, get a fresh one next tick
-                ReleaseDC(nullptr, hdcScreen);
-                hdcScreen = nullptr;
-                break;
-            }
-            GdiFlush();
-            pCap->seq++;
+            // The screen DC may have gone stale, get a fresh one next tick
+            ReleaseDC(nullptr, hdcScreen);
+            hdcScreen = nullptr;
+            continue;
         }
-        ReleaseSRWLockShared(&g_capturesLock);
+        GdiFlush();
+        g_capture.seq++;
     }
 
     if (hdcScreen)
         ReleaseDC(nullptr, hdcScreen);
     CloseHandle(hTimer);
 
-    AcquireSRWLockShared(&g_capturesLock);
-    for (auto &pCap : g_captures)
-        DestroyCaptureBuffer(pCap.get());
-    ReleaseSRWLockShared(&g_capturesLock);
+    AcquireSRWLockExclusive(&g_capture.lock);
+    FreeCaptureBuffer();
+    ReleaseSRWLockExclusive(&g_capture.lock);
     return 0;
 }
 
@@ -302,7 +334,9 @@ void StartCaptureThread(void)
         return;
     if (!g_hStopEvent)
         g_hStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (g_hStopEvent)
+    if (!g_hUploadedEvent)
+        g_hUploadedEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_hStopEvent && g_hUploadedEvent)
         g_hCaptureThread = CreateThread(nullptr, 0, CaptureThreadProc, nullptr, 0, nullptr);
 }
 
@@ -336,13 +370,14 @@ void DropLiveTextures(Pred pred)
     });
 }
 
-/* Copy the newest captured frame of a monitor into its Bubbles texture */
-void UpdateLiveTexture(LiveTexture &lt)
+/* Copy one monitor's part of the captured frame into its Bubbles texture; caller holds g_capture.lock shared */
+void UploadLiveTexture(LiveTexture &lt)
 {
-    MonitorCapture *pCap = lt.pCapture;
-    ULONG seq = pCap->seq;
+    RECT rcInCapture;
     D3DSURFACE_DESC desc;
-    if (seq == pCap->consumed || FAILED(lt.pTexture->GetLevelDesc(0, &desc)))
+    if (!g_capture.bits
+    || !IntersectRect(&rcInCapture, &lt.rc, &g_capture.rc) || !EqualRect(&rcInCapture, &lt.rc)
+    || FAILED(lt.pTexture->GetLevelDesc(0, &desc)))
         return;
 
     if (!lt.pStaging)
@@ -359,28 +394,23 @@ void UpdateLiveTexture(LiveTexture &lt)
         return;
 
     // Same BGRA layout as the TGA Bubbles builds, straight from BitBlt
-    SIZE_T srcPitch = (SIZE_T)Width(pCap->rc) * 4;
-    SIZE_T rowBytes = (std::min)(srcPitch, (SIZE_T)desc.Width * 4);
-    UINT   rows     = (std::min)((UINT)Height(pCap->rc), desc.Height);
+    SIZE_T srcPitch = (SIZE_T)Width(g_capture.rc) * 4;
+    SIZE_T rowBytes = (std::min)((SIZE_T)Width(lt.rc), (SIZE_T)desc.Width) * 4;
+    UINT   rows     = (std::min)((UINT)Height(lt.rc), desc.Height);
+    const BYTE *src = g_capture.bits
+        + (SIZE_T)(lt.rc.top - g_capture.rc.top) * srcPitch
+        + (SIZE_T)(lt.rc.left - g_capture.rc.left) * 4;
 
-    AcquireSRWLockShared(&pCap->lock);
-    const BYTE *src = pCap->bits;
-    if (src && (SIZE_T)lr.Pitch == srcPitch && rowBytes == srcPitch)
+    if ((SIZE_T)lr.Pitch == srcPitch && rowBytes == srcPitch)
     {
         memcpy(lr.pBits, src, srcPitch * rows);
     }
-    else if (src)
+    else
     {
         for (UINT y = 0; y < rows; y++)
             memcpy((BYTE *)lr.pBits + (SIZE_T)y * lr.Pitch, src + y * srcPitch, rowBytes);
     }
-    ReleaseSRWLockShared(&pCap->lock);
     lt.pStaging->UnlockRect(0);
-
-    // Hand the buffer back to the capture thread
-    pCap->consumed = seq;
-    if (!src)
-        return;
 
     IDirect3DSurface9 *pSrc, *pDst;
     if (SUCCEEDED(lt.pStaging->GetSurfaceLevel(0, &pSrc)))
@@ -393,6 +423,23 @@ void UpdateLiveTexture(LiveTexture &lt)
         }
         pSrc->Release();
     }
+}
+
+/* Upload the newest captured frame to every monitor's texture */
+void UpdateLiveTextures(void)
+{
+    ULONG seq = g_capture.seq;
+    if (seq == g_capture.consumed || g_liveTextures.empty())
+        return;
+
+    AcquireSRWLockShared(&g_capture.lock);
+    for (auto &lt : g_liveTextures)
+        UploadLiveTexture(lt);
+    ReleaseSRWLockShared(&g_capture.lock);
+
+    // Hand the buffer back to the capture thread
+    g_capture.consumed = seq;
+    SetEvent(g_hUploadedEvent);
 }
 
 /* Only the fullscreen saver windows; the Settings preview is a child window and never listed here */
@@ -439,22 +486,18 @@ int WINAPI GetDIBits_hook(HDC hdc, HBITMAP hbm, UINT start, UINT cLines, LPVOID 
         const BYTE *tgaData = (const BYTE *)lpvBits - 18;
 
         // A new snapshot of a known monitor only moves its TGA
-        for (auto &pCap : g_captures)
+        for (auto &monitor : g_monitors)
         {
-            if (EqualRect(&pCap->rc, g_pEnumMonitorRect))
+            if (EqualRect(&monitor.rc, g_pEnumMonitorRect))
             {
-                pCap->tgaData = tgaData;
+                monitor.tgaData = tgaData;
                 return result;
             }
         }
 
-        auto pCap = std::make_unique<MonitorCapture>();
-        pCap->rc = *g_pEnumMonitorRect;
-        pCap->tgaData = tgaData;
-
-        AcquireSRWLockExclusive(&g_capturesLock);
-        g_captures.push_back(std::move(pCap));
-        ReleaseSRWLockExclusive(&g_capturesLock);
+        AcquireSRWLockExclusive(&g_monitorsLock);
+        g_monitors.push_back({ *g_pEnumMonitorRect, tgaData });
+        ReleaseSRWLockExclusive(&g_monitorsLock);
     }
     return result;
 }
@@ -477,16 +520,16 @@ HRESULT Texture_CreateTextureFromTGAFileInMemory_hook(
     if (FAILED(hr) || !*ppTexture || !g_bLiveFeed || !g_bExcludedFromCapture)
         return hr;
 
-    for (auto &pCap : g_captures)
+    for (const auto &monitor : g_monitors)
     {
-        if (pCap->tgaData == pData)
+        if (monitor.tgaData == pData)
         {
             // Replaces any entry this render unit left behind without an Invalidate
             DropLiveTextures([&](const LiveTexture &lt)
             {
-                return lt.renderUnit == g_currentRenderUnit && lt.pCapture == pCap.get();
+                return lt.renderUnit == g_currentRenderUnit && EqualRect(&lt.rc, &monitor.rc);
             });
-            g_liveTextures.push_back({ g_currentRenderUnit, pDevice, *ppTexture, nullptr, pCap.get() });
+            g_liveTextures.push_back({ g_currentRenderUnit, monitor.rc, pDevice, *ppTexture, nullptr });
             StartCaptureThread();
             break;
         }
@@ -517,8 +560,7 @@ HRESULT BubblesScreensaver_InvalidateDeviceObjects_hook(void *pThis)
 HRESULT (*CD3DScreensaver_Render3DEnvironment_orig)(void *);
 HRESULT CD3DScreensaver_Render3DEnvironment_hook(void *pThis)
 {
-    for (auto &lt : g_liveTextures)
-        UpdateLiveTexture(lt);
+    UpdateLiveTextures();
     return CD3DScreensaver_Render3DEnvironment_orig(pThis);
 }
 
