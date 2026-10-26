@@ -54,7 +54,7 @@ its View hotkey commands. A File Pilot update that changes either may break it.
     - extensions: jpg jpeg jfif png gif webp bmp tif tiff heic heif avif svg ico psd raw dng cr2 cr3 nef arw orf rw2
       $name: Extensions
       $description: Separated by spaces or commas, without dots
-    - view: xl
+    - view: medium
       $name: View
       $options:
       - details: Details
@@ -69,23 +69,26 @@ its View hotkey commands. A File Pilot update that changes either may break it.
         For icon views: 30 (Medium) to 100 (Extra large). 0 keeps the view's
         own size. If File Pilot's view can't be found in memory, the zoom is
         rounded to Ctrl+wheel steps of 5.5% from 0.
+    - threshold: 60
+      $name: Match threshold (%)
+      $description: Share of the folder's files these extensions must reach
   - - name: Videos
     - extensions: mp4 mkv mov avi webm wmv m4v flv mpg mpeg ts mts m2ts 3gp
-    - view: large
+    - view: medium
     - zoom: 45
+    - threshold: 60
   - - name: Documents
     - extensions: pdf doc docx xls xlsx ppt pptx odt ods odp rtf txt md csv epub
     - view: tree
     - zoom: 0
+    - threshold: 60
   $name: Templates
   $description: >-
-    A template applies when its extensions make up at least the threshold share
+    A template applies when its extensions make up at least its threshold share
     of a folder's files. When several qualify, the one with the most files wins.
-- threshold: 60
-  $name: Match threshold (%)
 - mixedView: none
   $name: View for mixed folders
-  $description: Used when files exist but no template reaches the threshold
+  $description: Used when files exist but no template reaches its threshold
   $options:
   - none: FilePilot saved default
   - details: Details
@@ -147,15 +150,17 @@ struct Layout {
     int zoom = 0;  // percent, 0 keeps the view's own zoom
 };
 
+constexpr int kDefaultThreshold = 60;
+
 struct Rule {
     std::wstring name;
     std::unordered_set<std::wstring> extensions;
     Layout layout;
+    int threshold = kDefaultThreshold;  // percent of the folder's files
 };
 
 struct Settings {
     std::vector<Rule> rules;
-    int threshold = 60;
     int maxScan = 2000;
     View mixedView = View::None;
     View foldersOnlyView = View::None;
@@ -312,7 +317,10 @@ void LoadSettings() {
         }
 
         int zoom = std::clamp(Wh_GetIntSetting(L"rules[%d].zoom", i), 0, 100);
-        Rule rule{name, {}, {ParseView(view), zoom}};
+        // Templates added before thresholds existed read 0 here.
+        int threshold = Wh_GetIntSetting(L"rules[%d].threshold", i);
+        threshold = threshold > 0 ? std::min(threshold, 100) : kDefaultThreshold;
+        Rule rule{name, {}, {ParseView(view), zoom}, threshold};
         std::wstring token;
         for (wchar_t c : ToLower(extensions) + L" ") {
             if (c == L' ' || c == L',' || c == L';' || c == L'.') {
@@ -329,7 +337,6 @@ void LoadSettings() {
         }
     }
 
-    settings.threshold = std::clamp(Wh_GetIntSetting(L"threshold"), 1, 100);
     settings.maxScan = std::clamp(Wh_GetIntSetting(L"maxScan"), 10, 100000);
     settings.mixedView = ParseView(TakeString(Wh_GetStringSetting(L"mixedView")));
     settings.foldersOnlyView =
@@ -548,9 +555,15 @@ Layout ClassifyFolder(const std::wstring& path, const Settings& settings) {
     if (files == 0) {
         return {folders ? settings.foldersOnlyView : View::None};
     }
-    size_t best = std::max_element(counts.begin(), counts.end()) - counts.begin();
-    if (best < counts.size() &&
-        counts[best] * 100 >= settings.threshold * files) {
+    // Among templates reaching their own threshold, the most files wins.
+    size_t best = counts.size();
+    for (size_t i = 0; i < counts.size(); i++) {
+        bool qualifies = counts[i] * 100 >= settings.rules[i].threshold * files;
+        if (qualifies && (best == counts.size() || counts[i] > counts[best])) {
+            best = i;
+        }
+    }
+    if (best < counts.size()) {
         Wh_Log(L"%s: %d/%d files match %s", path.c_str(), counts[best], files,
                settings.rules[best].name.c_str());
         return settings.rules[best].layout;
