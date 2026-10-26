@@ -24,8 +24,10 @@ videos in large icons, mostly documents in details, and so on.
 - Presses the matching View hotkey from `FPilot-Config.json`
   (Ctrl+Shift+1..6 by default) inside the process. `GetKeyState` is hooked so
   File Pilot sees the modifiers without touching your real keyboard.
-- For a custom icon zoom, switches to Extra large icons (100%) and sends
-  Ctrl+wheel notches (5.5% each) with the cursor faked over the file list.
+- For a custom icon zoom, presses the nearest icon view, finds the folder's
+  view record in memory (the one whose zoom just changed) and writes the exact
+  zoom there. If the record can't be found, it switches to Details (0%) and
+  sends Ctrl+wheel notches (5.5% each) with the cursor faked over the list.
 - Long paths are shortened in the title, so the full path is recovered from
   the folders File Pilot opens.
 
@@ -64,9 +66,9 @@ its View hotkey commands. A File Pilot update that changes either may break it.
     - zoom: 45
       $name: Icon zoom (%)
       $description: >-
-        For icon views. 0 keeps the view's own size. Other values start from
-        Extra large icons (100%) and zoom out in Ctrl+wheel steps of 5.5%, so
-        the result is the nearest of 100, 94.5, 89, ... 45, 39.5, ...
+        For icon views: 30 (Medium) to 100 (Extra large). 0 keeps the view's
+        own size. If File Pilot's view can't be found in memory, the zoom is
+        rounded to Ctrl+wheel steps of 5.5% from 0.
   - - name: Videos
     - extensions: mp4 mkv mov avi webm wmv m4v flv mpg mpeg ts mts m2ts 3gp
     - view: large
@@ -181,8 +183,7 @@ constexpr ULONGLONG kWheelHoldMs = 200;
 // wheel arrives. Must stay below kWheelHoldMs.
 constexpr DWORD kHoverSettleMs = 50;
 constexpr DWORD kFakeInputPollMs = 10;
-// Extra large icons is 100% zoom; each wheel notch (120) zooms 5.5%.
-constexpr double kXLZoom = 100.0;
+// Each wheel notch (120) zooms 5.5%, at least with default settings.
 constexpr double kZoomPerNotch = 5.5;
 
 std::mutex g_settingsMutex;
@@ -616,12 +617,256 @@ POINT FakeCursorPos() {
     return point;
 }
 
-// Zooms like Ctrl+wheel, starting from Extra large icons (100%). File Pilot
-// zooms a fixed step per wheel message whatever its delta, so it gets one
-// message per notch.
-void SetIconZoom(HWND hwnd, int zoom) {
-    PressHotkey(hwnd, g_hotkeys[(int)View::XL]);
-    int notches = (int)std::lround((kXLZoom - zoom) / kZoomPerNotch);
+// ---------------------------------------------------------------------------
+// Zoom
+//
+// File Pilot keeps each folder view in a heap record shaped like ViewRecord,
+// whose column ratios add up to 1. The zoom alone picks the view: Details 0,
+// Tree 0.1, List 0.2, then icons from Medium 0.3 to Extra large 1.0. Writing
+// it zooms there smoothly from wherever the view is.
+
+struct ViewRecordHeader {
+    float zoom;
+    int sortedBy;
+    int columnCount;
+};
+
+struct ViewColumn {
+    int kind;
+    float ratio;
+};
+
+constexpr int kMinRecordColumns = 2;
+constexpr int kMaxRecordColumns = 16;
+constexpr size_t kMaxRecordSize =
+    sizeof(ViewRecordHeader) + kMaxRecordColumns * sizeof(ViewColumn);
+constexpr size_t kScanChunkSize = 4 << 20;
+constexpr float kViewPresetZoom[(int)View::Count] = {0.0f, 0.1f, 0.2f,
+                                                     0.3f, 0.65f, 1.0f};
+
+// Memory regions where view records were found. File Pilot makes a new record
+// on each navigation, usually in the same regions. Only the worker thread
+// uses it.
+std::vector<uintptr_t> g_recordRegions;
+
+bool IsViewRecord(const BYTE* data, size_t available) {
+    if (available < sizeof(ViewRecordHeader)) {
+        return false;
+    }
+    ViewRecordHeader header;
+    memcpy(&header, data, sizeof(header));
+    if (header.columnCount < kMinRecordColumns ||
+        header.columnCount > kMaxRecordColumns || !(header.zoom >= 0.0f) ||
+        !(header.zoom <= 1.0f) || header.sortedBy < 0 ||
+        header.sortedBy > 63) {
+        return false;
+    }
+    size_t size =
+        sizeof(ViewRecordHeader) + header.columnCount * sizeof(ViewColumn);
+    if (available < size) {
+        return false;
+    }
+
+    float total = 0.0f;
+    uint64_t kindsSeen = 0;
+    for (int i = 0; i < header.columnCount; i++) {
+        ViewColumn column;
+        memcpy(&column, data + sizeof(ViewRecordHeader) + i * sizeof(column),
+               sizeof(column));
+        uint64_t kindBit = 1ull << (column.kind & 63);
+        if (column.kind < 0 || column.kind > 63 || (kindsSeen & kindBit) ||
+            !(column.ratio > 0.0f) || !(column.ratio <= 1.0f)) {
+            return false;
+        }
+        kindsSeen |= kindBit;
+        total += column.ratio;
+    }
+    return std::fabs(total - 1.0f) < 0.02f;
+}
+
+// Memory may be freed under us, so it's read through ReadProcessMemory,
+// which fails instead of crashing.
+bool ReadOwnMemory(uintptr_t address, void* buffer, size_t size,
+                   size_t* read) {
+    SIZE_T bytesRead = 0;
+    BOOL ok = ReadProcessMemory(GetCurrentProcess(), (LPCVOID)address, buffer,
+                                size, &bytesRead);
+    *read = bytesRead;
+    return ok || bytesRead > 0;
+}
+
+bool ReadRecordZoom(uintptr_t address, float* zoom) {
+    BYTE data[kMaxRecordSize];
+    size_t read;
+    if (!ReadOwnMemory(address, data, sizeof(data), &read) ||
+        !IsViewRecord(data, read)) {
+        return false;
+    }
+    memcpy(zoom, data, sizeof(*zoom));
+    return true;
+}
+
+void ScanRegion(const MEMORY_BASIC_INFORMATION& info,
+                std::vector<BYTE>& chunk,
+                std::vector<uintptr_t>& records) {
+    uintptr_t regionStart = (uintptr_t)info.BaseAddress;
+    uintptr_t regionEnd = regionStart + info.RegionSize;
+    for (uintptr_t start = regionStart; start < regionEnd;
+         start += kScanChunkSize) {
+        size_t size = std::min<size_t>(chunk.size(), regionEnd - start);
+        size_t read;
+        if (!ReadOwnMemory(start, chunk.data(), size, &read)) {
+            continue;
+        }
+        size_t scanEnd = std::min<size_t>(read, kScanChunkSize);
+        for (size_t i = 0; i < scanEnd; i += 4) {
+            if (IsViewRecord(&chunk[i], read - i)) {
+                records.push_back(start + i);
+            }
+        }
+    }
+}
+
+bool IsScannableRegion(const MEMORY_BASIC_INFORMATION& info) {
+    return info.State == MEM_COMMIT && info.Type == MEM_PRIVATE &&
+           info.Protect == PAGE_READWRITE;
+}
+
+// Scans the given regions (by base address), or all writable private memory
+// when none are given.
+std::vector<uintptr_t> FindViewRecords(
+    const std::vector<uintptr_t>& regions = {}) {
+    ULONGLONG startTime = GetTickCount64();
+    std::vector<uintptr_t> records;
+    std::vector<BYTE> chunk(kScanChunkSize + kMaxRecordSize);
+    MEMORY_BASIC_INFORMATION info;
+    if (regions.empty()) {
+        for (uintptr_t address = 0;
+             VirtualQuery((LPCVOID)address, &info, sizeof(info));
+             address = (uintptr_t)info.BaseAddress + info.RegionSize) {
+            if (IsScannableRegion(info)) {
+                ScanRegion(info, chunk, records);
+            }
+        }
+    } else {
+        for (uintptr_t region : regions) {
+            if (VirtualQuery((LPCVOID)region, &info, sizeof(info)) &&
+                IsScannableRegion(info)) {
+                ScanRegion(info, chunk, records);
+            }
+        }
+    }
+    Wh_Log(L"Found %zu view records in %llu ms (%s)", records.size(),
+           GetTickCount64() - startTime,
+           regions.empty() ? L"all memory" : L"known regions");
+    return records;
+}
+
+std::vector<uintptr_t> RegionsOf(const std::vector<uintptr_t>& records) {
+    std::vector<uintptr_t> regions;
+    for (uintptr_t record : records) {
+        MEMORY_BASIC_INFORMATION info;
+        if (VirtualQuery((LPCVOID)record, &info, sizeof(info))) {
+            uintptr_t region = (uintptr_t)info.BaseAddress;
+            if (std::find(regions.begin(), regions.end(), region) ==
+                regions.end()) {
+                regions.push_back(region);
+            }
+        }
+    }
+    return regions;
+}
+
+View NearestIconPreset(float zoom) {
+    View nearest = View::Medium;
+    for (View view : {View::Medium, View::Large, View::XL}) {
+        if (std::fabs(kViewPresetZoom[(int)view] - zoom) <
+            std::fabs(kViewPresetZoom[(int)nearest] - zoom)) {
+            nearest = view;
+        }
+    }
+    return nearest;
+}
+
+// Finds the current folder's record by pressing a view preset and seeing
+// which record takes the preset's zoom, then writes the exact zoom there.
+bool SetZoomInMemory(HWND hwnd, int zoom) {
+    float targetZoom = zoom / 100.0f;
+    View preset = NearestIconPreset(targetZoom);
+    float presetZoom = kViewPresetZoom[(int)preset];
+
+    // Scan before pressing the preset, so the view doesn't sit at the preset
+    // while we search.
+    std::vector<uintptr_t> records = FindViewRecords(g_recordRegions);
+    if (records.empty()) {
+        records = FindViewRecords();
+    }
+    std::vector<std::pair<uintptr_t, float>> before;
+    for (uintptr_t record : records) {
+        float recordZoom;
+        if (ReadRecordZoom(record, &recordZoom)) {
+            before.push_back({record, recordZoom});
+        }
+    }
+
+    PressHotkey(hwnd, g_hotkeys[(int)preset]);
+
+    uintptr_t current = 0;
+    int changed = 0;
+    for (auto& [record, oldZoom] : before) {
+        float newZoom;
+        if (ReadRecordZoom(record, &newZoom) && newZoom != oldZoom &&
+            newZoom == presetZoom) {
+            current = record;
+            changed++;
+        }
+    }
+    if (changed != 1) {
+        // The record may be outside the known regions, or the folder was
+        // already at the preset: look for the one record at the preset's
+        // zoom in all memory.
+        records = FindViewRecords();
+        current = 0;
+        int atPreset = 0;
+        for (uintptr_t record : records) {
+            float recordZoom;
+            if (ReadRecordZoom(record, &recordZoom) &&
+                recordZoom == presetZoom) {
+                current = record;
+                atPreset++;
+            }
+        }
+        if (atPreset != 1) {
+            Wh_Log(L"Can't tell the view record apart: %d changed, %d at %g",
+                   changed, atPreset, presetZoom);
+            return false;
+        }
+    }
+    for (uintptr_t region : RegionsOf({current})) {
+        if (std::find(g_recordRegions.begin(), g_recordRegions.end(),
+                      region) == g_recordRegions.end()) {
+            g_recordRegions.push_back(region);
+        }
+    }
+
+    SIZE_T written = 0;
+    if (!WriteProcessMemory(GetCurrentProcess(), (LPVOID)current, &targetZoom,
+                            sizeof(targetZoom), &written)) {
+        return false;
+    }
+    // Wake File Pilot so it renders the new zoom.
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    Wh_Log(L"Zoom %d%% written to the view record at %p", zoom,
+           (void*)current);
+    return true;
+}
+
+// Fallback: zooms like Ctrl+wheel up from Details (0%). File Pilot zooms a
+// fixed step per wheel message whatever its delta, so it gets one message
+// per notch.
+void SetZoomWithWheel(HWND hwnd, int zoom) {
+    PressHotkey(hwnd, g_hotkeys[(int)View::Details]);
+    int notches = (int)std::lround(zoom / kZoomPerNotch);
     if (notches <= 0) {
         return;
     }
@@ -637,7 +882,7 @@ void SetIconZoom(HWND hwnd, int zoom) {
     Sleep(kHoverSettleMs);
     for (int i = 0; i < notches; i++) {
         PostMessageW(hwnd, WM_MOUSEWHEEL,
-                     MAKEWPARAM(MK_CONTROL | kMouseMark, (SHORT)-WHEEL_DELTA),
+                     MAKEWPARAM(MK_CONTROL | kMouseMark, (SHORT)WHEEL_DELTA),
                      MAKELPARAM(point.x, point.y));
     }
     WaitForFakeInput();
@@ -647,7 +892,10 @@ void ApplyLayout(HWND hwnd, const Layout& layout) {
     bool isIconView = layout.view == View::Medium ||
                       layout.view == View::Large || layout.view == View::XL;
     if (isIconView && layout.zoom > 0) {
-        SetIconZoom(hwnd, layout.zoom);
+        if (!SetZoomInMemory(hwnd, layout.zoom)) {
+            Wh_Log(L"Falling back to Ctrl+wheel zoom");
+            SetZoomWithWheel(hwnd, layout.zoom);
+        }
     } else {
         PressHotkey(hwnd, g_hotkeys[(int)layout.view]);
     }
