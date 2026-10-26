@@ -24,9 +24,8 @@ videos in large icons, mostly documents in details, and so on.
 - Presses the matching View hotkey from `FPilot-Config.json`
   (Ctrl+Shift+1..6 by default) inside the process. `GetKeyState` is hooked so
   File Pilot sees the modifiers without touching your real keyboard.
-- For a custom icon zoom, switches to Extra large icons (100%) and sends one
-  Ctrl+wheel message for the remaining distance (5.5% per notch), with the
-  cursor faked over the file list.
+- For a custom icon zoom, switches to Extra large icons (100%) and sends
+  Ctrl+wheel notches (5.5% each) with the cursor faked over the file list.
 - Long paths are shortened in the title, so the full path is recovered from
   the folders File Pilot opens.
 
@@ -66,7 +65,8 @@ its View hotkey commands. A File Pilot update that changes either may break it.
       $name: Icon zoom (%)
       $description: >-
         For icon views. 0 keeps the view's own size. Other values start from
-        Extra large icons (100%) and zoom out in 5.5% steps, like Ctrl+wheel.
+        Extra large icons (100%) and zoom out in Ctrl+wheel steps of 5.5%, so
+        the result is the nearest of 100, 94.5, 89, ... 45, 39.5, ...
   - - name: Videos
     - extensions: mp4 mkv mov avi webm wmv m4v flv mpg mpeg ts mts m2ts 3gp
     - view: large
@@ -177,6 +177,9 @@ constexpr ULONGLONG kFakeInputMaxMs = 1000;
 // Wheel zoom is applied while rendering rather than when the message is
 // handled, so its fake input is held at least this long.
 constexpr ULONGLONG kWheelHoldMs = 200;
+// Time for File Pilot to render a few frames with the fake cursor before the
+// wheel arrives. Must stay below kWheelHoldMs.
+constexpr DWORD kHoverSettleMs = 50;
 constexpr DWORD kFakeInputPollMs = 10;
 // Extra large icons is 100% zoom; each wheel notch (120) zooms 5.5%.
 constexpr double kXLZoom = 100.0;
@@ -573,20 +576,28 @@ LPARAM KeyLParam(const Hotkey& hotkey, bool up) {
     return lParam;
 }
 
-// Posts one tagged message and waits until File Pilot has run a frame with it,
-// so the next message gets its own fake modifiers.
-void PostTagged(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+void BeginFakeInput() {
     g_fakeSince = GetTickCount64();
     g_fakePhase = kFakePosted;
-    PostMessageW(hwnd, message, wParam, lParam);
+}
+
+// Waits until File Pilot has run a frame with the tagged messages, so
+// whatever comes next gets its own fake modifiers.
+void WaitForFakeInput() {
     while (g_fakePhase != kFakeIdle) {
         if (GetTickCount64() - g_fakeSince > kFakeInputMaxMs) {
-            Wh_Log(L"File Pilot didn't handle message %u in time", message);
+            Wh_Log(L"File Pilot didn't handle fake input in time");
             g_fakePhase = kFakeIdle;
             break;
         }
         Sleep(kFakeInputPollMs);
     }
+}
+
+void PostTagged(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    BeginFakeInput();
+    PostMessageW(hwnd, message, wParam, lParam);
+    WaitForFakeInput();
 }
 
 void PressHotkey(HWND hwnd, const Hotkey& hotkey) {
@@ -605,23 +616,31 @@ POINT FakeCursorPos() {
     return point;
 }
 
-// Zooms like Ctrl+wheel, starting from Extra large icons (100%).
+// Zooms like Ctrl+wheel, starting from Extra large icons (100%). File Pilot
+// zooms a fixed step per wheel message whatever its delta, so it gets one
+// message per notch.
 void SetIconZoom(HWND hwnd, int zoom) {
     PressHotkey(hwnd, g_hotkeys[(int)View::XL]);
-    int delta = (int)std::lround(-WHEEL_DELTA * (kXLZoom - zoom) / kZoomPerNotch);
-    if (delta == 0) {
+    int notches = (int)std::lround((kXLZoom - zoom) / kZoomPerNotch);
+    if (notches <= 0) {
         return;
     }
     // File Pilot hit-tests the wheel against the previous frame's cursor, so
-    // a move to the file list gets a frame of its own first.
+    // a move to the file list gets a few frames first. The fake cursor must
+    // not lapse in between, or the wheel lands outside the list.
     POINT point = FakeCursorPos();
     POINT clientPoint = point;
     ScreenToClient(hwnd, &clientPoint);
-    PostTagged(hwnd, WM_MOUSEMOVE, kMouseMark,
-               MAKELPARAM(clientPoint.x, clientPoint.y));
-    PostTagged(hwnd, WM_MOUSEWHEEL,
-               MAKEWPARAM(MK_CONTROL | kMouseMark, (SHORT)delta),
-               MAKELPARAM(point.x, point.y));
+    BeginFakeInput();
+    PostMessageW(hwnd, WM_MOUSEMOVE, kMouseMark,
+                 MAKELPARAM(clientPoint.x, clientPoint.y));
+    Sleep(kHoverSettleMs);
+    for (int i = 0; i < notches; i++) {
+        PostMessageW(hwnd, WM_MOUSEWHEEL,
+                     MAKEWPARAM(MK_CONTROL | kMouseMark, (SHORT)-WHEEL_DELTA),
+                     MAKELPARAM(point.x, point.y));
+    }
+    WaitForFakeInput();
 }
 
 void ApplyLayout(HWND hwnd, const Layout& layout) {
