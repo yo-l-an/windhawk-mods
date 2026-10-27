@@ -24,10 +24,12 @@ videos in large icons, mostly documents in details, and so on.
 - Presses the matching View hotkey from `FPilot-Config.json`
   (Ctrl+Shift+1..6 by default) inside the process. `GetKeyState` is hooked so
   File Pilot sees the modifiers without touching your real keyboard.
-- For a custom icon zoom, presses the nearest icon view, finds the folder's
-  view record in memory (the one whose zoom just changed) and writes the exact
-  zoom there. If the record can't be found, it switches to Details (0%) and
-  sends Ctrl+wheel notches (5.5% each) with the cursor faked over the list.
+- For a custom icon zoom, finds the folder's view record in memory and writes
+  the exact zoom there, without opening File Pilot's view popover. The first
+  time in a session it presses the nearest icon view to learn where records
+  live, which shows the popover once. If the record can't be found, it
+  switches to Details (0%) and sends Ctrl+wheel notches (5.5% each) with the
+  cursor faked over the list.
 - Long paths are shortened in the title, so the full path is recovered from
   the folders File Pilot opens.
 
@@ -829,6 +831,31 @@ class ViewRecords {
 
     std::vector<uintptr_t> FindEverywhere() { return Scan(nullptr); }
 
+    // The current folder's record, found without touching File Pilot's UI.
+    // In the known regions File Pilot replaces a folder's record on each
+    // navigation, so it's the one record that wasn't there last time, or the
+    // only record there. 0 when neither singles one out.
+    uintptr_t FindFreshInKnownRegions() {
+        std::vector<uintptr_t> records = FindInKnownRegions();
+        uintptr_t fresh = 0;
+        int freshCount = 0;
+        for (uintptr_t record : records) {
+            if (std::find(seen_.begin(), seen_.end(), record) == seen_.end()) {
+                fresh = record;
+                freshCount++;
+            }
+        }
+        seen_ = records;
+        if (freshCount == 1) {
+            return fresh;
+        }
+        return records.size() == 1 ? records[0] : 0;
+    }
+
+    // Marks the records now in the known regions as seen, after the current
+    // record was found another way.
+    void MarkKnownRegionsSeen() { seen_ = FindInKnownRegions(); }
+
     // Remembers the region holding a record: File Pilot keeps allocating new
     // records in the same few regions.
     void RememberRegionOf(uintptr_t record) {
@@ -978,6 +1005,7 @@ class ViewRecords {
 
     std::vector<BYTE> chunk_;
     std::vector<uintptr_t> regions_;
+    std::vector<uintptr_t> seen_;  // records in the known regions last time
 };
 
 ViewRecords g_viewRecords;
@@ -1083,10 +1111,10 @@ uintptr_t FindOnlyRecordAt(const std::vector<uintptr_t>& records, float zoom) {
 }
 
 // Finds the current folder's record by pressing the nearest icon preset and
-// seeing which record takes its zoom, then writes the exact zoom there.
-bool SetZoomInMemory(HWND hwnd, const Config& config, int zoom) {
-    float targetZoom = zoom / 100.0f;
-    View preset = NearestIconPreset(targetZoom);
+// seeing which record takes its zoom. File Pilot shows its view popover for
+// a moment, so this is only for when FindFreshInKnownRegions can't tell.
+uintptr_t FindRecordWithPreset(HWND hwnd, const Config& config, float zoom) {
+    View preset = NearestIconPreset(zoom);
     float presetZoom = filepilot::kViewZoom[static_cast<int>(preset)];
 
     // Scan before pressing the preset, so the view doesn't sit at the preset
@@ -1122,16 +1150,30 @@ bool SetZoomInMemory(HWND hwnd, const Config& config, int zoom) {
         current = FindOnlyRecordAt(g_viewRecords.FindEverywhere(), presetZoom);
         if (!current) {
             Wh_Log(L"Can't tell the view record apart (%d changed)", changed);
-            return false;
         }
     }
-    g_viewRecords.RememberRegionOf(current);
+    return current;
+}
+
+// Writes the exact zoom into the current folder's view record.
+bool SetZoomInMemory(HWND hwnd, const Config& config, int zoom) {
+    float targetZoom = zoom / 100.0f;
+    uintptr_t current = g_viewRecords.FindFreshInKnownRegions();
+    if (!current) {
+        Wh_Log(L"No fresh view record, finding it with a preset");
+        current = FindRecordWithPreset(hwnd, config, targetZoom);
+        if (!current) {
+            return false;
+        }
+        g_viewRecords.RememberRegionOf(current);
+        g_viewRecords.MarkKnownRegionsSeen();
+    }
 
     if (!ViewRecords::WriteZoom(current, targetZoom)) {
         return false;
     }
-    // Wake File Pilot so it renders the new zoom.
-    PostMessageW(hwnd, WM_NULL, 0, 0);
+    // Make File Pilot render the new zoom on its next frame.
+    InvalidateRect(hwnd, nullptr, FALSE);
     Wh_Log(L"Zoom %d%% written to the view record at %p", zoom,
            reinterpret_cast<void*>(current));
     return true;
