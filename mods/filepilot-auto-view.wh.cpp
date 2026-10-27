@@ -41,8 +41,9 @@ videos in large icons, mostly documents in details, and so on.
 - Disable the mod in Windhawk to turn detection off entirely.
 
 ## Limitations
-Relies on File Pilot's window title format (`Name (Path) - File Pilot vX`) and
-its View hotkey commands. A File Pilot update that changes either may break it.
+Relies on File Pilot's window title format (`Name (Path) - File Pilot vX`),
+its View hotkey commands and the layout of its view records in memory. A File
+Pilot update that changes any of them may break it.
 */
 // ==/WindhawkModReadme==
 
@@ -122,802 +123,126 @@ its View hotkey commands. A File Pilot update that changes either may break it.
 */
 // ==/WindhawkModSettings==
 
+// Layout of this file, from the bottom up:
+//   filepilot    every assumption about File Pilot; check here after an update
+//   text         string and path helpers
+//   Config       immutable settings snapshot, swapped on settings changes
+//   ManualViews  views picked with hotkeys, persisted per folder
+//   main_window  File Pilot's window and UI thread
+//   fake_input   tagged messages and the modifier/cursor state they fake
+//   synth        posting hotkeys and wheel zoom to File Pilot
+//   ViewRecords  finding and writing File Pilot's view records in memory
+//   layouts      classifying a folder and applying its layout
+//   DirectoryLog, Navigator   which folder is shown, and the worker thread
+//   hooks, lifecycle
+
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
-#include <cwctype>
-#include <deque>
-#include <map>
+#include <cstdlib>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <regex>
 #include <string>
 #include <thread>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
+namespace {
+
 enum class View { None = -1, Details, Tree, List, Medium, Large, XL, Count };
+constexpr int kViewCount = static_cast<int>(View::Count);
 
-struct Hotkey {
-    UINT vk = 0;
-    bool ctrl = false;
-    bool shift = false;
-    bool alt = false;
-};
+// ===========================================================================
+// File Pilot internals
 
-struct Layout {
-    View view = View::None;
-    int zoom = 0;  // percent, 0 keeps the view's own zoom
-};
-
-constexpr int kDefaultThreshold = 60;
-
-struct Rule {
-    std::wstring name;
-    std::unordered_set<std::wstring> extensions;
-    Layout layout;
-    int threshold = kDefaultThreshold;  // percent of the folder's files
-};
-
-struct Settings {
-    std::vector<Rule> rules;
-    int maxScan = 2000;
-    View mixedView = View::None;
-    View foldersOnlyView = View::None;
-    bool rememberManual = true;
-    std::vector<std::wstring> excludedFolders;
-};
+namespace filepilot {
 
 constexpr wchar_t kWindowClass[] = L"File Pilot";
+// Titles read "<name> (<path>) - File Pilot v0.8.5". Long paths lose their
+// leading folders: "photos (Local\Temp\x\photos) - File Pilot v0.8.5".
 constexpr wchar_t kTitleSuffix[] = L" - File Pilot";
-// Synthetic input is tagged so File Pilot sees fake modifiers for it only.
-// Keystrokes: reserved lParam bits 25-28 hold the tag and the modifiers.
-// Mouse move and wheel: an unused MK_* bit holds the tag, MK_CONTROL/MK_SHIFT
-// the rest.
-constexpr LPARAM kKeyMark = 1 << 25;
-constexpr int kKeyModsShift = 26;
-constexpr WORD kMouseMark = 0x0800;
-constexpr int kModCtrl = 1, kModShift = 2, kModAlt = 4;
-// Fake input lasts until File Pilot's next frame (its message loop drained
-// the queue and came back), or this long at most.
-constexpr ULONGLONG kFakeInputMaxMs = 1000;
-// Wheel zoom is applied while rendering rather than when the message is
-// handled, so its fake input is held at least this long.
-constexpr ULONGLONG kWheelHoldMs = 200;
-// Time for File Pilot to render a few frames with the fake cursor before the
-// wheel arrives. Must stay below kWheelHoldMs.
-constexpr DWORD kHoverSettleMs = 50;
-constexpr DWORD kFakeInputPollMs = 10;
-// Each wheel notch (120) zooms 5.5%, at least with default settings.
-constexpr double kZoomPerNotch = 5.5;
+constexpr wchar_t kConfigFile[] =
+    L"%APPDATA%\\Voidstar\\FilePilot\\FPilot-Config.json";
 
-std::mutex g_settingsMutex;
-Settings g_settings;
-Hotkey g_hotkeys[(int)View::Count];
+// "HK_View<command>" hotkey commands in the config file, indexed by View.
+// Unbound ones default to Ctrl+Shift+1..6 in the same order.
+constexpr const char* kViewCommands[kViewCount] = {
+    "Details", "Tree", "List", "MediumIcons", "LargeIcons", "XLIcons"};
 
-std::mutex g_manualMutex;
-std::map<std::wstring, View> g_manualViews;  // lowercased path -> view
+// The zoom each View hotkey sets. Zoom alone picks the view, so values in
+// between are valid too: icons go from Medium (0.3) to Extra large (1.0).
+constexpr float kViewZoom[kViewCount] = {0.0f, 0.1f, 0.2f, 0.3f, 0.65f, 1.0f};
 
-std::atomic<HWND> g_mainWnd{nullptr};
+// Percent per Ctrl+wheel message, whatever the message's delta.
+constexpr double kZoomPerWheelMessage = 5.5;
 
-// Directories File Pilot listed recently, newest last. Long titles show only
-// the tail of the path, which is resolved against these.
-constexpr size_t kMaxListedDirs = 64;
-constexpr int kResolveAttempts = 20;
-constexpr DWORD kResolveRetryMs = 50;
-std::mutex g_listedMutex;
-std::deque<std::wstring> g_listedDirs;
-thread_local bool t_ownScan = false;
-
-std::mutex g_navMutex;
-std::condition_variable g_navCv;
-std::wstring g_titlePath;     // as shown in the title, possibly a tail
-std::wstring g_resolvedPath;  // full path of the current folder, once known
-std::wstring g_lastResolvedPath;  // last known full path, kept across changes
-std::wstring g_pendingPath;
-bool g_hasPending = false;
-bool g_stopWorker = false;
-std::atomic<unsigned> g_navGeneration{0};
-std::thread g_worker;
-
-enum FakePhase { kFakeIdle, kFakePosted, kFakeDelivered, kFakeQueueDrained };
-std::atomic<int> g_fakePhase{kFakeIdle};
-std::atomic<int> g_fakeMods{0};
-std::atomic<ULONGLONG> g_fakeSince{0};
-std::atomic<ULONGLONG> g_fakeHoldMs{0};
-// While a tagged wheel message is handled, the cursor appears to be over the
-// middle of the window so the zoom lands on the file list.
-std::atomic<bool> g_fakeCursor{false};
-std::atomic<DWORD> g_mainThreadId{0};
-
-using SetWindowTextW_t = decltype(&SetWindowTextW);
-using GetKeyState_t = decltype(&GetKeyState);
-using PeekMessageW_t = decltype(&PeekMessageW);
-using TranslateMessage_t = decltype(&TranslateMessage);
-using FindFirstFileW_t = decltype(&FindFirstFileW);
-using FindFirstFileExW_t = decltype(&FindFirstFileExW);
-using CreateFileW_t = decltype(&CreateFileW);
-using GetCursorPos_t = decltype(&GetCursorPos);
-using WindowFromPoint_t = decltype(&WindowFromPoint);
-GetCursorPos_t GetCursorPos_Original;
-WindowFromPoint_t WindowFromPoint_Original;
-SetWindowTextW_t SetWindowTextW_Original;
-CreateFileW_t CreateFileW_Original;
-FindFirstFileW_t FindFirstFileW_Original;
-FindFirstFileExW_t FindFirstFileExW_Original;
-GetKeyState_t GetKeyState_Original;
-PeekMessageW_t PeekMessageW_Original;
-TranslateMessage_t TranslateMessage_Original;
-
-// ---------------------------------------------------------------------------
-// Helpers
-
-std::wstring ToLower(std::wstring s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](wchar_t c) { return (wchar_t)std::towlower(c); });
-    return s;
-}
-
-std::wstring TakeString(PCWSTR value) {
-    std::wstring result = value ? value : L"";
-    Wh_FreeStringSetting(value);
-    return result;
-}
-
-std::wstring NormalizePath(std::wstring path) {
-    std::replace(path.begin(), path.end(), L'/', L'\\');
-    while (path.size() > 3 && path.back() == L'\\') {
-        path.pop_back();
-    }
-    return ToLower(path);
-}
-
-const wchar_t* kViewNames[] = {L"details", L"tree", L"list",
-                               L"medium",  L"large", L"xl"};
-
-View ParseView(const std::wstring& name) {
-    for (int i = 0; i < (int)View::Count; i++) {
-        if (name == kViewNames[i]) {
-            return (View)i;
-        }
-    }
-    return View::None;
-}
-
-PCWSTR ViewName(View view) {
-    return view == View::None ? L"none" : kViewNames[(int)view];
-}
-
-bool IsMainWindow(HWND hwnd) {
-    if (hwnd == g_mainWnd) {
-        return true;
-    }
-    wchar_t className[64];
-    if (!GetClassNameW(hwnd, className, ARRAYSIZE(className)) ||
-        wcscmp(className, kWindowClass) != 0 || GetParent(hwnd)) {
-        return false;
-    }
-    g_mainWnd = hwnd;
-    g_mainThreadId = GetWindowThreadProcessId(hwnd, nullptr);
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Settings and File Pilot hotkeys
-
-void LoadSettings() {
-    Settings settings;
-    for (int i = 0;; i++) {
-        std::wstring name = TakeString(Wh_GetStringSetting(L"rules[%d].name", i));
-        std::wstring extensions =
-            TakeString(Wh_GetStringSetting(L"rules[%d].extensions", i));
-        std::wstring view = TakeString(Wh_GetStringSetting(L"rules[%d].view", i));
-        if (name.empty() && extensions.empty() && view.empty()) {
-            break;
-        }
-
-        int zoom = std::clamp(Wh_GetIntSetting(L"rules[%d].zoom", i), 0, 100);
-        // Templates added before thresholds existed read 0 here.
-        int threshold = Wh_GetIntSetting(L"rules[%d].threshold", i);
-        threshold = threshold > 0 ? std::min(threshold, 100) : kDefaultThreshold;
-        Rule rule{name, {}, {ParseView(view), zoom}, threshold};
-        std::wstring token;
-        for (wchar_t c : ToLower(extensions) + L" ") {
-            if (c == L' ' || c == L',' || c == L';' || c == L'.') {
-                if (!token.empty()) {
-                    rule.extensions.insert(token);
-                }
-                token.clear();
-            } else {
-                token += c;
-            }
-        }
-        if (rule.layout.view != View::None && !rule.extensions.empty()) {
-            settings.rules.push_back(std::move(rule));
-        }
-    }
-
-    settings.maxScan = std::clamp(Wh_GetIntSetting(L"maxScan"), 10, 100000);
-    settings.mixedView = ParseView(TakeString(Wh_GetStringSetting(L"mixedView")));
-    settings.foldersOnlyView =
-        ParseView(TakeString(Wh_GetStringSetting(L"foldersOnlyView")));
-    settings.rememberManual = Wh_GetIntSetting(L"rememberManual");
-
-    // Missing array items read as empty strings, so stop at the first one.
-    for (int i = 0;; i++) {
-        std::wstring folder =
-            TakeString(Wh_GetStringSetting(L"excludedFolders[%d]", i));
-        if (folder.empty()) {
-            break;
-        }
-        settings.excludedFolders.push_back(NormalizePath(folder));
-    }
-
-    std::lock_guard lock(g_settingsMutex);
-    g_settings = std::move(settings);
-}
-
-Hotkey ParseHotkey(const std::string& text) {
-    Hotkey hotkey;
-    size_t start = 0;
-    while (start <= text.size()) {
-        size_t end = text.find('+', start);
-        if (end == std::string::npos) {
-            end = text.size();
-        }
-        std::string token = text.substr(start, end - start);
-        if (token == "Ctrl") {
-            hotkey.ctrl = true;
-        } else if (token == "Shift") {
-            hotkey.shift = true;
-        } else if (token == "Alt") {
-            hotkey.alt = true;
-        } else if (token.size() == 1 && std::isalnum((unsigned char)token[0])) {
-            hotkey.vk = (UINT)std::toupper((unsigned char)token[0]);
-        } else if (token.size() >= 2 && token[0] == 'F' &&
-                   std::isdigit((unsigned char)token[1])) {
-            int n = std::atoi(token.c_str() + 1);
-            if (n >= 1 && n <= 24) {
-                hotkey.vk = VK_F1 + n - 1;
-            }
-        }
-        start = end + 1;
-    }
-    return hotkey;
-}
-
-void LoadHotkeys() {
-    for (int i = 0; i < (int)View::Count; i++) {
-        g_hotkeys[i] = {(UINT)('1' + i), true, true, false};
-    }
-
-    wchar_t appData[MAX_PATH];
-    if (!GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH)) {
-        return;
-    }
-    std::wstring configPath =
-        std::wstring(appData) + L"\\Voidstar\\FilePilot\\FPilot-Config.json";
-    HANDLE file = CreateFileW(configPath.c_str(), GENERIC_READ,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                              OPEN_EXISTING, 0, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        Wh_Log(L"Can't open %s, using default hotkeys", configPath.c_str());
-        return;
-    }
-    std::string config(GetFileSize(file, nullptr), '\0');
-    DWORD read = 0;
-    ReadFile(file, config.data(), (DWORD)config.size(), &read, nullptr);
-    CloseHandle(file);
-    config.resize(read);
-
-    static const std::pair<const char*, View> kCommands[] = {
-        {"Details", View::Details},         {"Tree", View::Tree},
-        {"List", View::List},               {"MediumIcons", View::Medium},
-        {"LargeIcons", View::Large},        {"XLIcons", View::XL}};
-    std::regex pattern(
-        R"re("Keys"\s*:\s*\[\s*"([^"]+)"[^\]]*\]\s*,\s*"Command"\s*:\s*"HK_View(\w+)")re");
-    for (std::sregex_iterator it(config.begin(), config.end(), pattern), end;
-         it != end; ++it) {
-        for (auto& [command, view] : kCommands) {
-            if ((*it)[2] == command) {
-                Hotkey hotkey = ParseHotkey((*it)[1]);
-                if (hotkey.vk) {
-                    g_hotkeys[(int)view] = hotkey;
-                } else {
-                    Wh_Log(L"Unsupported hotkey for HK_View%S", command);
-                }
-            }
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Remembered manual views
-
-void SaveManualViews() {
-    std::wstring data;
-    for (auto& [path, view] : g_manualViews) {
-        data += ViewName(view);
-        data += L'|';
-        data += path;
-        data += L'\n';
-    }
-    Wh_SetStringValue(L"manualViews", data.c_str());
-}
-
-void LoadManualViews() {
-    std::vector<wchar_t> buffer(1 << 18);
-    Wh_GetStringValue(L"manualViews", buffer.data(), buffer.size());
-    std::wstring data = buffer.data();
-
-    std::lock_guard lock(g_manualMutex);
-    g_manualViews.clear();
-    size_t start = 0;
-    while (start < data.size()) {
-        size_t end = data.find(L'\n', start);
-        if (end == std::wstring::npos) {
-            end = data.size();
-        }
-        std::wstring line = data.substr(start, end - start);
-        size_t separator = line.find(L'|');
-        if (separator != std::wstring::npos) {
-            View view = ParseView(line.substr(0, separator));
-            if (view != View::None) {
-                g_manualViews[line.substr(separator + 1)] = view;
-            }
-        }
-        start = end + 1;
-    }
-}
-
-void RecordManualView(View view) {
-    {
-        std::lock_guard lock(g_settingsMutex);
-        if (!g_settings.rememberManual) {
-            return;
-        }
-    }
-    std::wstring path;
-    {
-        std::lock_guard lock(g_navMutex);
-        path = g_resolvedPath;
-    }
-    if (path.empty()) {
-        return;
-    }
-    Wh_Log(L"Remembering %s for %s", ViewName(view), path.c_str());
-    std::lock_guard lock(g_manualMutex);
-    g_manualViews[NormalizePath(path)] = view;
-    SaveManualViews();
-}
-
-// ---------------------------------------------------------------------------
-// Folder classification
-
-bool IsExcluded(const std::wstring& normalizedPath, const Settings& settings) {
-    for (auto& folder : settings.excludedFolders) {
-        if (normalizedPath.compare(0, folder.size(), folder) == 0 &&
-            (normalizedPath.size() == folder.size() ||
-             normalizedPath[folder.size()] == L'\\' || folder.back() == L'\\')) {
-            return true;
-        }
-    }
-    return false;
-}
-
-Layout ClassifyFolder(const std::wstring& path, const Settings& settings) {
-    std::wstring pattern = path;
-    if (pattern.back() != L'\\') {
-        pattern += L'\\';
-    }
-    pattern += L'*';
-
-    WIN32_FIND_DATAW data;
-    t_ownScan = true;
-    HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data,
-                                   FindExSearchNameMatch, nullptr,
-                                   FIND_FIRST_EX_LARGE_FETCH);
-    t_ownScan = false;
-    if (find == INVALID_HANDLE_VALUE) {
-        return {};
-    }
-
-    std::vector<int> counts(settings.rules.size());
-    int files = 0, folders = 0;
-    do {
-        if (wcscmp(data.cFileName, L".") == 0 ||
-            wcscmp(data.cFileName, L"..") == 0) {
-            continue;
-        }
-        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            folders++;
-            continue;
-        }
-        if (data.dwFileAttributes &
-            (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) {
-            continue;
-        }
-        files++;
-        const wchar_t* dot = wcsrchr(data.cFileName, L'.');
-        if (!dot) {
-            continue;
-        }
-        std::wstring extension = ToLower(dot + 1);
-        for (size_t i = 0; i < settings.rules.size(); i++) {
-            if (settings.rules[i].extensions.count(extension)) {
-                counts[i]++;
-                break;
-            }
-        }
-    } while (files + folders < settings.maxScan && FindNextFileW(find, &data));
-    FindClose(find);
-
-    if (files == 0) {
-        return {folders ? settings.foldersOnlyView : View::None};
-    }
-    // Among templates reaching their own threshold, the most files wins.
-    size_t best = counts.size();
-    for (size_t i = 0; i < counts.size(); i++) {
-        bool qualifies = counts[i] * 100 >= settings.rules[i].threshold * files;
-        if (qualifies && (best == counts.size() || counts[i] > counts[best])) {
-            best = i;
-        }
-    }
-    if (best < counts.size()) {
-        Wh_Log(L"%s: %d/%d files match %s", path.c_str(), counts[best], files,
-               settings.rules[best].name.c_str());
-        return settings.rules[best].layout;
-    }
-    Wh_Log(L"%s: mixed (%d files)", path.c_str(), files);
-    return {settings.mixedView};
-}
-
-// ---------------------------------------------------------------------------
-// Synthetic hotkey presses
-
-LPARAM KeyLParam(const Hotkey& hotkey, bool up) {
-    int mods = (hotkey.ctrl ? kModCtrl : 0) | (hotkey.shift ? kModShift : 0) |
-               (hotkey.alt ? kModAlt : 0);
-    LPARAM lParam = 1 |
-                    ((LPARAM)MapVirtualKeyW(hotkey.vk, MAPVK_VK_TO_VSC) << 16) |
-                    kKeyMark | ((LPARAM)mods << kKeyModsShift);
-    if (hotkey.alt) {
-        lParam |= 1 << 29;
-    }
-    if (up) {
-        lParam |= 0xC0000000;
-    }
-    return lParam;
-}
-
-void BeginFakeInput() {
-    g_fakeSince = GetTickCount64();
-    g_fakePhase = kFakePosted;
-}
-
-// Waits until File Pilot has run a frame with the tagged messages, so
-// whatever comes next gets its own fake modifiers.
-void WaitForFakeInput() {
-    while (g_fakePhase != kFakeIdle) {
-        if (GetTickCount64() - g_fakeSince > kFakeInputMaxMs) {
-            Wh_Log(L"File Pilot didn't handle fake input in time");
-            g_fakePhase = kFakeIdle;
-            break;
-        }
-        Sleep(kFakeInputPollMs);
-    }
-}
-
-void PostTagged(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    BeginFakeInput();
-    PostMessageW(hwnd, message, wParam, lParam);
-    WaitForFakeInput();
-}
-
-void PressHotkey(HWND hwnd, const Hotkey& hotkey) {
-    UINT down = hotkey.alt ? WM_SYSKEYDOWN : WM_KEYDOWN;
-    UINT up = hotkey.alt ? WM_SYSKEYUP : WM_KEYUP;
-    PostTagged(hwnd, down, hotkey.vk, KeyLParam(hotkey, false));
-    PostTagged(hwnd, up, hotkey.vk, KeyLParam(hotkey, true));
-}
-
-POINT FakeCursorPos() {
-    HWND hwnd = g_mainWnd;
-    RECT rect{};
-    GetClientRect(hwnd, &rect);
-    POINT point{(rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2};
-    ClientToScreen(hwnd, &point);
-    return point;
-}
-
-// ---------------------------------------------------------------------------
-// Zoom
-//
-// File Pilot keeps each folder view in a heap record shaped like ViewRecord,
-// whose column ratios add up to 1. The zoom alone picks the view: Details 0,
-// Tree 0.1, List 0.2, then icons from Medium 0.3 to Extra large 1.0. Writing
-// it zooms there smoothly from wherever the view is.
-
+// Each folder view lives in a heap record: this header, then columnCount
+// ViewColumns whose ratios add up to 1. A new record is made on each
+// navigation.
 struct ViewRecordHeader {
     float zoom;
-    int sortedBy;
-    int columnCount;
+    int32_t sortedBy;
+    int32_t columnCount;
 };
 
 struct ViewColumn {
-    int kind;
+    int32_t kind;
     float ratio;
 };
 
 constexpr int kMinRecordColumns = 2;
 constexpr int kMaxRecordColumns = 16;
+constexpr int kMaxColumnKind = 63;
+constexpr int kMaxSortedBy = 63;
 constexpr size_t kMaxRecordSize =
     sizeof(ViewRecordHeader) + kMaxRecordColumns * sizeof(ViewColumn);
-constexpr size_t kScanChunkSize = 4 << 20;
-constexpr float kViewPresetZoom[(int)View::Count] = {0.0f, 0.1f, 0.2f,
-                                                     0.3f, 0.65f, 1.0f};
 
-// Memory regions where view records were found. File Pilot makes a new record
-// on each navigation, usually in the same regions. Only the worker thread
-// uses it.
-std::vector<uintptr_t> g_recordRegions;
+}  // namespace filepilot
 
-bool IsViewRecord(const BYTE* data, size_t available) {
-    if (available < sizeof(ViewRecordHeader)) {
-        return false;
-    }
-    ViewRecordHeader header;
-    memcpy(&header, data, sizeof(header));
-    if (header.columnCount < kMinRecordColumns ||
-        header.columnCount > kMaxRecordColumns || !(header.zoom >= 0.0f) ||
-        !(header.zoom <= 1.0f) || header.sortedBy < 0 ||
-        header.sortedBy > 63) {
-        return false;
-    }
-    size_t size =
-        sizeof(ViewRecordHeader) + header.columnCount * sizeof(ViewColumn);
-    if (available < size) {
-        return false;
-    }
+// ===========================================================================
+// Text and paths
 
-    float total = 0.0f;
-    uint64_t kindsSeen = 0;
-    for (int i = 0; i < header.columnCount; i++) {
-        ViewColumn column;
-        memcpy(&column, data + sizeof(ViewRecordHeader) + i * sizeof(column),
-               sizeof(column));
-        uint64_t kindBit = 1ull << (column.kind & 63);
-        if (column.kind < 0 || column.kind > 63 || (kindsSeen & kindBit) ||
-            !(column.ratio > 0.0f) || !(column.ratio <= 1.0f)) {
-            return false;
-        }
-        kindsSeen |= kindBit;
-        total += column.ratio;
-    }
-    return std::fabs(total - 1.0f) < 0.02f;
-}
+namespace text {
 
-// Memory may be freed under us, so it's read through ReadProcessMemory,
-// which fails instead of crashing.
-bool ReadOwnMemory(uintptr_t address, void* buffer, size_t size,
-                   size_t* read) {
-    SIZE_T bytesRead = 0;
-    BOOL ok = ReadProcessMemory(GetCurrentProcess(), (LPCVOID)address, buffer,
-                                size, &bytesRead);
-    *read = bytesRead;
-    return ok || bytesRead > 0;
-}
-
-bool ReadRecordZoom(uintptr_t address, float* zoom) {
-    BYTE data[kMaxRecordSize];
-    size_t read;
-    if (!ReadOwnMemory(address, data, sizeof(data), &read) ||
-        !IsViewRecord(data, read)) {
-        return false;
-    }
-    memcpy(zoom, data, sizeof(*zoom));
-    return true;
-}
-
-void ScanRegion(const MEMORY_BASIC_INFORMATION& info,
-                std::vector<BYTE>& chunk,
-                std::vector<uintptr_t>& records) {
-    uintptr_t regionStart = (uintptr_t)info.BaseAddress;
-    uintptr_t regionEnd = regionStart + info.RegionSize;
-    for (uintptr_t start = regionStart; start < regionEnd;
-         start += kScanChunkSize) {
-        size_t size = std::min<size_t>(chunk.size(), regionEnd - start);
-        size_t read;
-        if (!ReadOwnMemory(start, chunk.data(), size, &read)) {
-            continue;
-        }
-        size_t scanEnd = std::min<size_t>(read, kScanChunkSize);
-        for (size_t i = 0; i < scanEnd; i += 4) {
-            if (IsViewRecord(&chunk[i], read - i)) {
-                records.push_back(start + i);
-            }
-        }
+void LowerInPlace(std::wstring& s) {
+    if (!s.empty()) {
+        CharLowerBuffW(s.data(), static_cast<DWORD>(s.size()));
     }
 }
 
-bool IsScannableRegion(const MEMORY_BASIC_INFORMATION& info) {
-    return info.State == MEM_COMMIT && info.Type == MEM_PRIVATE &&
-           info.Protect == PAGE_READWRITE;
+std::wstring ToLower(std::wstring s) {
+    LowerInPlace(s);
+    return s;
 }
 
-// Scans the given regions (by base address), or all writable private memory
-// when none are given.
-std::vector<uintptr_t> FindViewRecords(
-    const std::vector<uintptr_t>& regions = {}) {
-    ULONGLONG startTime = GetTickCount64();
-    std::vector<uintptr_t> records;
-    std::vector<BYTE> chunk(kScanChunkSize + kMaxRecordSize);
-    MEMORY_BASIC_INFORMATION info;
-    if (regions.empty()) {
-        for (uintptr_t address = 0;
-             VirtualQuery((LPCVOID)address, &info, sizeof(info));
-             address = (uintptr_t)info.BaseAddress + info.RegionSize) {
-            if (IsScannableRegion(info)) {
-                ScanRegion(info, chunk, records);
-            }
-        }
-    } else {
-        for (uintptr_t region : regions) {
-            if (VirtualQuery((LPCVOID)region, &info, sizeof(info)) &&
-                IsScannableRegion(info)) {
-                ScanRegion(info, chunk, records);
-            }
-        }
-    }
-    Wh_Log(L"Found %zu view records in %llu ms (%s)", records.size(),
-           GetTickCount64() - startTime,
-           regions.empty() ? L"all memory" : L"known regions");
-    return records;
+bool EqualsNoCase(const wchar_t* a, size_t aLength, const wchar_t* b,
+                  size_t bLength) {
+    return CompareStringOrdinal(a, static_cast<int>(aLength), b,
+                                static_cast<int>(bLength), TRUE) == CSTR_EQUAL;
 }
 
-std::vector<uintptr_t> RegionsOf(const std::vector<uintptr_t>& records) {
-    std::vector<uintptr_t> regions;
-    for (uintptr_t record : records) {
-        MEMORY_BASIC_INFORMATION info;
-        if (VirtualQuery((LPCVOID)record, &info, sizeof(info))) {
-            uintptr_t region = (uintptr_t)info.BaseAddress;
-            if (std::find(regions.begin(), regions.end(), region) ==
-                regions.end()) {
-                regions.push_back(region);
-            }
-        }
-    }
-    return regions;
+bool EndsWithNoCase(const std::wstring& s, const std::wstring& suffix) {
+    return s.size() >= suffix.size() &&
+           EqualsNoCase(s.data() + s.size() - suffix.size(), suffix.size(),
+                        suffix.data(), suffix.size());
 }
 
-View NearestIconPreset(float zoom) {
-    View nearest = View::Medium;
-    for (View view : {View::Medium, View::Large, View::XL}) {
-        if (std::fabs(kViewPresetZoom[(int)view] - zoom) <
-            std::fabs(kViewPresetZoom[(int)nearest] - zoom)) {
-            nearest = view;
-        }
+// Lowercase, backslashes, no trailing separator (except "c:\"): the form
+// paths are compared and stored in.
+std::wstring NormalizePath(std::wstring path) {
+    std::replace(path.begin(), path.end(), L'/', L'\\');
+    while (path.size() > 3 && path.back() == L'\\') {
+        path.pop_back();
     }
-    return nearest;
+    LowerInPlace(path);
+    return path;
 }
 
-// Finds the current folder's record by pressing a view preset and seeing
-// which record takes the preset's zoom, then writes the exact zoom there.
-bool SetZoomInMemory(HWND hwnd, int zoom) {
-    float targetZoom = zoom / 100.0f;
-    View preset = NearestIconPreset(targetZoom);
-    float presetZoom = kViewPresetZoom[(int)preset];
-
-    // Scan before pressing the preset, so the view doesn't sit at the preset
-    // while we search.
-    std::vector<uintptr_t> records = FindViewRecords(g_recordRegions);
-    if (records.empty()) {
-        records = FindViewRecords();
-    }
-    std::vector<std::pair<uintptr_t, float>> before;
-    for (uintptr_t record : records) {
-        float recordZoom;
-        if (ReadRecordZoom(record, &recordZoom)) {
-            before.push_back({record, recordZoom});
-        }
-    }
-
-    PressHotkey(hwnd, g_hotkeys[(int)preset]);
-
-    uintptr_t current = 0;
-    int changed = 0;
-    for (auto& [record, oldZoom] : before) {
-        float newZoom;
-        if (ReadRecordZoom(record, &newZoom) && newZoom != oldZoom &&
-            newZoom == presetZoom) {
-            current = record;
-            changed++;
-        }
-    }
-    if (changed != 1) {
-        // The record may be outside the known regions, or the folder was
-        // already at the preset: look for the one record at the preset's
-        // zoom in all memory.
-        records = FindViewRecords();
-        current = 0;
-        int atPreset = 0;
-        for (uintptr_t record : records) {
-            float recordZoom;
-            if (ReadRecordZoom(record, &recordZoom) &&
-                recordZoom == presetZoom) {
-                current = record;
-                atPreset++;
-            }
-        }
-        if (atPreset != 1) {
-            Wh_Log(L"Can't tell the view record apart: %d changed, %d at %g",
-                   changed, atPreset, presetZoom);
-            return false;
-        }
-    }
-    for (uintptr_t region : RegionsOf({current})) {
-        if (std::find(g_recordRegions.begin(), g_recordRegions.end(),
-                      region) == g_recordRegions.end()) {
-            g_recordRegions.push_back(region);
-        }
-    }
-
-    SIZE_T written = 0;
-    if (!WriteProcessMemory(GetCurrentProcess(), (LPVOID)current, &targetZoom,
-                            sizeof(targetZoom), &written)) {
-        return false;
-    }
-    // Wake File Pilot so it renders the new zoom.
-    PostMessageW(hwnd, WM_NULL, 0, 0);
-    Wh_Log(L"Zoom %d%% written to the view record at %p", zoom,
-           (void*)current);
-    return true;
-}
-
-// Fallback: zooms like Ctrl+wheel up from Details (0%). File Pilot zooms a
-// fixed step per wheel message whatever its delta, so it gets one message
-// per notch.
-void SetZoomWithWheel(HWND hwnd, int zoom) {
-    PressHotkey(hwnd, g_hotkeys[(int)View::Details]);
-    int notches = (int)std::lround(zoom / kZoomPerNotch);
-    if (notches <= 0) {
-        return;
-    }
-    // File Pilot hit-tests the wheel against the previous frame's cursor, so
-    // a move to the file list gets a few frames first. The fake cursor must
-    // not lapse in between, or the wheel lands outside the list.
-    POINT point = FakeCursorPos();
-    POINT clientPoint = point;
-    ScreenToClient(hwnd, &clientPoint);
-    BeginFakeInput();
-    PostMessageW(hwnd, WM_MOUSEMOVE, kMouseMark,
-                 MAKELPARAM(clientPoint.x, clientPoint.y));
-    Sleep(kHoverSettleMs);
-    for (int i = 0; i < notches; i++) {
-        PostMessageW(hwnd, WM_MOUSEWHEEL,
-                     MAKEWPARAM(MK_CONTROL | kMouseMark, (SHORT)WHEEL_DELTA),
-                     MAKELPARAM(point.x, point.y));
-    }
-    WaitForFakeInput();
-}
-
-void ApplyLayout(HWND hwnd, const Layout& layout) {
-    bool isIconView = layout.view == View::Medium ||
-                      layout.view == View::Large || layout.view == View::XL;
-    if (isIconView && layout.zoom > 0) {
-        if (!SetZoomInMemory(hwnd, layout.zoom)) {
-            Wh_Log(L"Falling back to Ctrl+wheel zoom");
-            SetZoomWithWheel(hwnd, layout.zoom);
-        }
-    } else {
-        PressHotkey(hwnd, g_hotkeys[(int)layout.view]);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Current folder detection
-
-bool LooksLikePath(const std::wstring& s) {
+bool IsAbsolutePath(const std::wstring& s) {
     return (s.size() >= 2 && std::iswalpha(s[0]) && s[1] == L':') ||
            s.rfind(L"\\\\", 0) == 0;
 }
@@ -930,238 +255,1317 @@ std::wstring LastComponent(std::wstring path) {
     return slash == std::wstring::npos ? path : path.substr(slash + 1);
 }
 
-// "TOOLSDEV (F:\_WORK\TOOLSDEV) - File Pilot v0.8.5" -> "F:\_WORK\TOOLSDEV".
-// Long paths lose their leading folders: "photos (Local\Temp\x\photos) - ..."
-// -> "Local\Temp\x\photos".
-std::wstring PathFromTitle(const std::wstring& title) {
-    size_t suffix = title.rfind(kTitleSuffix);
-    if (suffix == std::wstring::npos || suffix < 2 || title[suffix - 1] != L')') {
-        return {};
-    }
-    std::wstring head = title.substr(0, suffix - 1);
-    std::wstring fallback;
-    for (size_t open = head.find(L" ("); open != std::wstring::npos;
-         open = head.find(L" (", open + 1)) {
-        std::wstring path = head.substr(open + 2);
-        if (ToLower(LastComponent(path)) == ToLower(head.substr(0, open))) {
-            return path;
-        }
-        if (fallback.empty() && LooksLikePath(path)) {
-            fallback = path;
-        }
-    }
-    return fallback;
+std::wstring TakeSetting(PCWSTR value) {
+    std::wstring result = value ? value : L"";
+    Wh_FreeStringSetting(value);
+    return result;
 }
 
-// Records "C:\dir" from a listing pattern such as "\\?\C:\dir\*".
-void RecordListedDir(LPCWSTR pattern) {
-    if (!pattern || t_ownScan) {
-        return;
-    }
-    std::wstring dir = pattern;
-    if (dir.find_first_of(L"*?") != std::wstring::npos) {
-        size_t slash = dir.find_last_of(L"\\/");
-        if (slash == std::wstring::npos) {
-            return;
+}  // namespace text
+
+// ===========================================================================
+// Views
+
+constexpr const wchar_t* kViewNames[kViewCount] = {
+    L"details", L"tree", L"list", L"medium", L"large", L"xl"};
+
+View ParseView(const std::wstring& name) {
+    for (int i = 0; i < kViewCount; i++) {
+        if (name == kViewNames[i]) {
+            return static_cast<View>(i);
         }
-        dir.resize(slash + 1);
     }
-    std::replace(dir.begin(), dir.end(), L'/', L'\\');
-    if (dir.back() != L'\\') {
-        dir += L'\\';
-    }
-    if (dir.rfind(L"\\\\?\\UNC\\", 0) == 0) {
-        dir = L"\\\\" + dir.substr(8);
-    } else if (dir.rfind(L"\\\\?\\", 0) == 0) {
-        dir = dir.substr(4);
-    }
-    if (dir.size() > 3) {
-        dir.pop_back();  // keep "C:\" for drive roots
-    }
-
-    if (!LooksLikePath(dir)) {
-        return;
-    }
-
-    std::lock_guard lock(g_listedMutex);
-    if (!g_listedDirs.empty() && g_listedDirs.back() == dir) {
-        return;
-    }
-    g_listedDirs.push_back(std::move(dir));
-    if (g_listedDirs.size() > kMaxListedDirs) {
-        g_listedDirs.pop_front();
-    }
+    return View::None;
 }
 
-std::wstring FindListedDir(const std::wstring& tail) {
-    std::wstring needle = L"\\" + NormalizePath(tail);
-    std::lock_guard lock(g_listedMutex);
-    for (auto it = g_listedDirs.rbegin(); it != g_listedDirs.rend(); ++it) {
-        std::wstring dir = ToLower(*it);
-        if (dir.size() > needle.size() &&
-            dir.compare(dir.size() - needle.size(), needle.size(), needle) == 0) {
-            return *it;
-        }
+PCWSTR ViewName(View view) {
+    return view == View::None ? L"none" : kViewNames[static_cast<int>(view)];
+}
+
+// ===========================================================================
+// Config
+
+struct Hotkey {
+    UINT vk = 0;
+    bool ctrl = false;
+    bool shift = false;
+    bool alt = false;
+};
+
+struct Layout {
+    View view = View::None;
+    int zoom = 0;  // percent, 0 keeps the view's own zoom
+
+    bool IsIconView() const {
+        return view == View::Medium || view == View::Large || view == View::XL;
     }
-    return {};
+};
+
+struct Rule {
+    std::wstring name;
+    Layout layout;
+    int threshold = 0;  // percent of the folder's files
+};
+
+// A settings snapshot. It is never modified once published, so threads keep
+// using the one they took while settings change.
+struct Config {
+    std::vector<Rule> rules;
+    // Lowercase extension -> index of the first rule listing it.
+    std::unordered_map<std::wstring, size_t> ruleByExtension;
+    int maxScan = 2000;
+    View mixedView = View::None;
+    View foldersOnlyView = View::None;
+    bool rememberManual = true;
+    std::vector<std::wstring> excludedFolders;  // normalized
+    std::array<Hotkey, kViewCount> hotkeys;
+
+    bool IsExcluded(const std::wstring& normalizedPath) const {
+        for (const std::wstring& folder : excludedFolders) {
+            if (normalizedPath.compare(0, folder.size(), folder) == 0 &&
+                (normalizedPath.size() == folder.size() ||
+                 normalizedPath[folder.size()] == L'\\' ||
+                 folder.back() == L'\\')) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+namespace config {
+
+constexpr int kDefaultThreshold = 60;
+
+std::mutex g_mutex;
+std::shared_ptr<const Config> g_current = std::make_shared<Config>();
+
+std::shared_ptr<const Config> Current() {
+    std::lock_guard lock(g_mutex);
+    return g_current;
 }
 
-bool IsDirectory(const std::wstring& path) {
-    DWORD attributes = GetFileAttributesW(path.c_str());
-    return attributes != INVALID_FILE_ATTRIBUTES &&
-           (attributes & FILE_ATTRIBUTE_DIRECTORY);
-}
-
-// Navigation mostly stays in one tree, so try "<ancestor of the last folder>\
-// <tail>" from the deepest ancestor up.
-std::wstring FindUnderLastFolder(const std::wstring& tail,
-                                 std::wstring ancestor) {
-    while (!ancestor.empty()) {
-        std::wstring candidate = ancestor;
-        if (candidate.back() != L'\\') {
-            candidate += L'\\';
-        }
-        candidate += tail;
-        if (IsDirectory(candidate)) {
-            return candidate;
-        }
-        size_t slash = ancestor.find_last_of(L'\\', ancestor.size() - 2);
-        if (slash == std::wstring::npos) {
+void LoadRules(Config& config) {
+    for (int i = 0;; i++) {
+        std::wstring name =
+            text::TakeSetting(Wh_GetStringSetting(L"rules[%d].name", i));
+        std::wstring extensions =
+            text::TakeSetting(Wh_GetStringSetting(L"rules[%d].extensions", i));
+        std::wstring view =
+            text::TakeSetting(Wh_GetStringSetting(L"rules[%d].view", i));
+        if (name.empty() && extensions.empty() && view.empty()) {
             break;
         }
-        ancestor.resize(slash + 1);
-    }
-    return {};
-}
 
-// Turns a title path into a full path, giving File Pilot a moment to list
-// the folder when the title only shows its tail.
-std::wstring ResolveTitlePath(const std::wstring& titlePath,
-                              unsigned generation) {
-    if (LooksLikePath(titlePath)) {
-        return titlePath;
-    }
-    std::wstring lastFolder;
-    {
-        std::lock_guard lock(g_navMutex);
-        lastFolder = g_lastResolvedPath;
-    }
-    std::wstring path = FindUnderLastFolder(titlePath, lastFolder);
-    for (int i = 0; path.empty() && i < kResolveAttempts &&
-                    generation == g_navGeneration;
-         i++) {
-        path = FindListedDir(titlePath);
-        if (path.empty()) {
-            Sleep(kResolveRetryMs);
+        Rule rule{name, {ParseView(view)}, kDefaultThreshold};
+        rule.layout.zoom =
+            std::clamp(Wh_GetIntSetting(L"rules[%d].zoom", i), 0, 100);
+        // Templates made before thresholds existed read 0 here.
+        int threshold = Wh_GetIntSetting(L"rules[%d].threshold", i);
+        if (threshold > 0) {
+            rule.threshold = std::min(threshold, 100);
+        }
+        if (rule.layout.view == View::None) {
+            continue;
+        }
+
+        size_t index = config.rules.size();
+        bool hasExtension = false;
+        std::wstring token;
+        for (wchar_t c : text::ToLower(extensions) + L" ") {
+            if (c == L' ' || c == L',' || c == L';' || c == L'.') {
+                if (!token.empty()) {
+                    // The first rule listing an extension keeps it.
+                    config.ruleByExtension.emplace(token, index);
+                    hasExtension = true;
+                }
+                token.clear();
+            } else {
+                token += c;
+            }
+        }
+        if (hasExtension) {
+            config.rules.push_back(std::move(rule));
         }
     }
-    if (!path.empty()) {
-        return path;
-    }
-    Wh_Log(L"Can't resolve %s", titlePath.c_str());
-    return {};
 }
 
-void OnTitleChanged(PCWSTR title, bool apply) {
-    std::wstring path = PathFromTitle(title);
-    std::lock_guard lock(g_navMutex);
-    if (path == g_titlePath) {
-        return;
+Hotkey ParseHotkey(const std::string& keys) {
+    Hotkey hotkey;
+    size_t start = 0;
+    while (start <= keys.size()) {
+        size_t end = keys.find('+', start);
+        if (end == std::string::npos) {
+            end = keys.size();
+        }
+        std::string token = keys.substr(start, end - start);
+        if (token == "Ctrl") {
+            hotkey.ctrl = true;
+        } else if (token == "Shift") {
+            hotkey.shift = true;
+        } else if (token == "Alt") {
+            hotkey.alt = true;
+        } else if (token.size() == 1 &&
+                   std::isalnum(static_cast<unsigned char>(token[0]))) {
+            hotkey.vk = std::toupper(static_cast<unsigned char>(token[0]));
+        } else if (token.size() >= 2 && token[0] == 'F' &&
+                   std::isdigit(static_cast<unsigned char>(token[1]))) {
+            int n = std::atoi(token.c_str() + 1);
+            if (n >= 1 && n <= 24) {
+                hotkey.vk = VK_F1 + n - 1;
+            }
+        }
+        start = end + 1;
     }
-    g_titlePath = path;
-    g_resolvedPath = LooksLikePath(path) ? path : L"";
-    if (!g_resolvedPath.empty()) {
-        g_lastResolvedPath = g_resolvedPath;
+    return hotkey;
+}
+
+std::string ReadFilePilotConfig() {
+    wchar_t path[MAX_PATH];
+    if (!ExpandEnvironmentStringsW(filepilot::kConfigFile, path, MAX_PATH)) {
+        return {};
     }
-    g_navGeneration++;
-    if (apply && !path.empty()) {
-        g_pendingPath = path;
-        g_hasPending = true;
-        g_navCv.notify_one();
+    HANDLE file = CreateFileW(path, GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        Wh_Log(L"Can't open %s, using default hotkeys", path);
+        return {};
+    }
+    std::string contents(GetFileSize(file, nullptr), '\0');
+    DWORD read = 0;
+    ReadFile(file, contents.data(), static_cast<DWORD>(contents.size()), &read,
+             nullptr);
+    CloseHandle(file);
+    contents.resize(read);
+    return contents;
+}
+
+void LoadHotkeys(std::array<Hotkey, kViewCount>& hotkeys) {
+    for (int i = 0; i < kViewCount; i++) {
+        hotkeys[i] = {static_cast<UINT>('1' + i), true, true, false};
+    }
+
+    std::string contents = ReadFilePilotConfig();
+    std::regex binding(
+        R"re("Keys"\s*:\s*\[\s*"([^"]+)"[^\]]*\]\s*,\s*"Command"\s*:\s*"HK_View(\w+)")re");
+    for (std::sregex_iterator it(contents.begin(), contents.end(), binding),
+         end;
+         it != end; ++it) {
+        for (int i = 0; i < kViewCount; i++) {
+            if ((*it)[2] != filepilot::kViewCommands[i]) {
+                continue;
+            }
+            Hotkey hotkey = ParseHotkey((*it)[1]);
+            if (hotkey.vk) {
+                hotkeys[i] = hotkey;
+            } else {
+                Wh_Log(L"Unsupported hotkey for HK_View%S",
+                       filepilot::kViewCommands[i]);
+            }
+        }
     }
 }
 
-void ApplyView(const std::wstring& titlePath, unsigned generation) {
-    std::wstring path = ResolveTitlePath(titlePath, generation);
-    if (path.empty()) {
-        return;
+void Reload() {
+    auto config = std::make_shared<Config>();
+    LoadRules(*config);
+    config->maxScan = std::clamp(Wh_GetIntSetting(L"maxScan"), 10, 100000);
+    config->mixedView =
+        ParseView(text::TakeSetting(Wh_GetStringSetting(L"mixedView")));
+    config->foldersOnlyView =
+        ParseView(text::TakeSetting(Wh_GetStringSetting(L"foldersOnlyView")));
+    config->rememberManual = Wh_GetIntSetting(L"rememberManual");
+    // Missing array items read as empty strings, so stop at the first one.
+    for (int i = 0;; i++) {
+        std::wstring folder = text::TakeSetting(
+            Wh_GetStringSetting(L"excludedFolders[%d]", i));
+        if (folder.empty()) {
+            break;
+        }
+        config->excludedFolders.push_back(text::NormalizePath(folder));
     }
-    {
-        std::lock_guard lock(g_navMutex);
-        if (generation != g_navGeneration) {
+    LoadHotkeys(config->hotkeys);
+
+    std::lock_guard lock(g_mutex);
+    g_current = std::move(config);
+}
+
+}  // namespace config
+
+// ===========================================================================
+// Manual views
+
+// Views picked with View hotkeys, by normalized folder path. Stored with
+// Wh_SetStringValue as "view|path" lines.
+class ManualViews {
+   public:
+    void Load() {
+        std::vector<wchar_t> buffer(kMaxStoredChars);
+        Wh_GetStringValue(kValueName, buffer.data(), buffer.size());
+        std::wstring data = buffer.data();
+
+        std::lock_guard lock(mutex_);
+        views_.clear();
+        size_t start = 0;
+        while (start < data.size()) {
+            size_t end = data.find(L'\n', start);
+            if (end == std::wstring::npos) {
+                end = data.size();
+            }
+            size_t separator = data.find(L'|', start);
+            if (separator < end) {
+                View view = ParseView(data.substr(start, separator - start));
+                if (view != View::None) {
+                    views_[data.substr(separator + 1, end - separator - 1)] =
+                        view;
+                }
+            }
+            start = end + 1;
+        }
+    }
+
+    View Find(const std::wstring& normalizedPath) {
+        std::lock_guard lock(mutex_);
+        auto it = views_.find(normalizedPath);
+        return it == views_.end() ? View::None : it->second;
+    }
+
+    void Remember(const std::wstring& normalizedPath, View view) {
+        std::lock_guard lock(mutex_);
+        views_[normalizedPath] = view;
+        SaveLocked();
+    }
+
+    void Clear() {
+        std::lock_guard lock(mutex_);
+        views_.clear();
+        SaveLocked();
+    }
+
+   private:
+    static constexpr PCWSTR kValueName = L"manualViews";
+    static constexpr size_t kMaxStoredChars = 1 << 18;
+
+    void SaveLocked() {
+        std::wstring data;
+        for (const auto& [path, view] : views_) {
+            data += ViewName(view);
+            data += L'|';
+            data += path;
+            data += L'\n';
+        }
+        Wh_SetStringValue(kValueName, data.c_str());
+    }
+
+    std::mutex mutex_;
+    std::unordered_map<std::wstring, View> views_;
+};
+
+ManualViews g_manualViews;
+
+// ===========================================================================
+// Main window
+
+namespace main_window {
+
+std::atomic<HWND> g_hwnd{nullptr};
+std::atomic<DWORD> g_threadId{0};
+
+HWND Handle() {
+    return g_hwnd;
+}
+
+bool IsUiThread() {
+    return GetCurrentThreadId() == g_threadId;
+}
+
+// True for File Pilot's top-level window, which is remembered on first sight.
+bool Is(HWND hwnd) {
+    if (hwnd == g_hwnd) {
+        return true;
+    }
+    wchar_t className[64];
+    if (!GetClassNameW(hwnd, className, ARRAYSIZE(className)) ||
+        wcscmp(className, filepilot::kWindowClass) != 0 || GetParent(hwnd)) {
+        return false;
+    }
+    g_threadId = GetWindowThreadProcessId(hwnd, nullptr);
+    g_hwnd = hwnd;
+    return true;
+}
+
+// The middle of the client area, which is over the file list.
+POINT ListCenter() {
+    HWND hwnd = g_hwnd;
+    RECT rect{};
+    GetClientRect(hwnd, &rect);
+    POINT point{(rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2};
+    ClientToScreen(hwnd, &point);
+    return point;
+}
+
+}  // namespace main_window
+
+// ===========================================================================
+// Fake input
+//
+// The mod drives File Pilot with posted messages. File Pilot reads modifiers
+// with GetKeyState and the mouse with GetCursorPos, so while a tagged message
+// is being handled those hooks report what the message asks for:
+// - keystrokes carry the tag and modifiers in reserved lParam bits 25-28;
+// - mouse moves and wheels carry the tag in an unused MK_* bit, and the
+//   cursor appears over the file list.
+// Fake input lasts until File Pilot has drained its queue and started the
+// next frame, plus a minimum hold for wheels, which are applied while
+// rendering.
+
+namespace fake_input {
+
+constexpr LPARAM kKeyTag = 1 << 25;
+constexpr int kKeyModsShift = 26;
+constexpr WORD kMouseTag = 0x0800;
+constexpr int kCtrl = 1, kShift = 2, kAlt = 4;
+constexpr ULONGLONG kMaxMs = 1000;
+constexpr ULONGLONG kWheelHoldMs = 200;
+constexpr DWORD kPollMs = 10;
+
+enum Phase { kIdle, kPosted, kDelivered, kQueueDrained };
+
+std::atomic<int> g_phase{kIdle};
+std::atomic<int> g_mods{0};
+std::atomic<bool> g_cursor{false};
+std::atomic<ULONGLONG> g_since{0};
+std::atomic<ULONGLONG> g_holdMs{0};
+
+int ModsOf(const Hotkey& hotkey) {
+    return (hotkey.ctrl ? kCtrl : 0) | (hotkey.shift ? kShift : 0) |
+           (hotkey.alt ? kAlt : 0);
+}
+
+bool IsTaggedKey(const MSG& msg) {
+    return msg.message >= WM_KEYFIRST && msg.message <= WM_KEYLAST &&
+           (msg.lParam & kKeyTag);
+}
+
+void End() {
+    g_mods = 0;
+    g_cursor = false;
+    g_phase = kIdle;
+}
+
+// Called by the sender before posting tagged messages.
+void Begin() {
+    g_since = GetTickCount64();
+    g_phase = kPosted;
+}
+
+// Called by the sender: waits until File Pilot has run a frame with the tagged
+// messages, so whatever comes next gets its own fake input.
+void Wait() {
+    while (g_phase != kIdle) {
+        if (GetTickCount64() - g_since > kMaxMs) {
+            Wh_Log(L"File Pilot didn't handle fake input in time");
+            End();
             return;
         }
-        g_resolvedPath = path;
-        g_lastResolvedPath = path;
+        Sleep(kPollMs);
+    }
+}
+
+bool IsActive() {
+    int phase = g_phase;
+    if (phase != kDelivered && phase != kQueueDrained) {
+        return false;
+    }
+    if (GetTickCount64() - g_since > kMaxMs) {
+        End();
+        return false;
+    }
+    return true;
+}
+
+bool IsModifierFaked(int vk) {
+    int mods = g_mods;
+    if (!mods) {
+        return false;
+    }
+    switch (vk) {
+        case VK_CONTROL:
+        case VK_LCONTROL:
+            return (mods & kCtrl) && IsActive();
+        case VK_SHIFT:
+        case VK_LSHIFT:
+            return (mods & kShift) && IsActive();
+        case VK_MENU:
+        case VK_LMENU:
+            return (mods & kAlt) && IsActive();
+    }
+    return false;
+}
+
+bool IsCursorFaked() {
+    return g_cursor && IsActive();
+}
+
+void Deliver(int mods, bool cursor, ULONGLONG holdMs) {
+    g_since = GetTickCount64();
+    g_holdMs = holdMs;
+    g_mods = mods;
+    g_cursor = cursor;
+    g_phase = kDelivered;
+}
+
+// Called for each message File Pilot takes off its queue. Returns whether it
+// was one of ours.
+bool OnMessage(const MSG& msg) {
+    if (msg.message == WM_MOUSEWHEEL || msg.message == WM_MOUSEMOVE) {
+        WORD keys = GET_KEYSTATE_WPARAM(msg.wParam);
+        if (!(keys & kMouseTag)) {
+            return false;
+        }
+        Deliver((keys & MK_CONTROL ? kCtrl : 0) | (keys & MK_SHIFT ? kShift : 0),
+                true, kWheelHoldMs);
+        return true;
+    }
+    if (IsTaggedKey(msg)) {
+        Deliver((msg.lParam >> kKeyModsShift) & 7, false, 0);
+        return true;
+    }
+    return false;
+}
+
+// File Pilot's UI thread found its queue empty: the next frame is starting.
+void OnQueueDrained() {
+    int delivered = kDelivered;
+    g_phase.compare_exchange_strong(delivered, kQueueDrained);
+}
+
+// File Pilot's UI thread is back for more messages: that frame is done.
+void OnFrameDone() {
+    if (g_phase == kQueueDrained && GetTickCount64() - g_since >= g_holdMs) {
+        End();
+    }
+}
+
+}  // namespace fake_input
+
+// ===========================================================================
+// Synthetic input
+
+namespace synth {
+
+// Lets File Pilot render a few frames with the fake cursor before the wheel
+// arrives. Must stay below fake_input::kWheelHoldMs.
+constexpr DWORD kHoverSettleMs = 50;
+
+LPARAM KeyLParam(const Hotkey& hotkey, bool up) {
+    LPARAM lParam =
+        1 | (static_cast<LPARAM>(MapVirtualKeyW(hotkey.vk, MAPVK_VK_TO_VSC))
+             << 16) |
+        fake_input::kKeyTag |
+        (static_cast<LPARAM>(fake_input::ModsOf(hotkey))
+         << fake_input::kKeyModsShift);
+    if (hotkey.alt) {
+        lParam |= 1 << 29;
+    }
+    if (up) {
+        lParam |= 0xC0000000;
+    }
+    return lParam;
+}
+
+void PostAndWait(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    fake_input::Begin();
+    PostMessageW(hwnd, message, wParam, lParam);
+    fake_input::Wait();
+}
+
+void PressHotkey(HWND hwnd, const Hotkey& hotkey) {
+    UINT down = hotkey.alt ? WM_SYSKEYDOWN : WM_KEYDOWN;
+    UINT up = hotkey.alt ? WM_SYSKEYUP : WM_KEYUP;
+    PostAndWait(hwnd, down, hotkey.vk, KeyLParam(hotkey, false));
+    PostAndWait(hwnd, up, hotkey.vk, KeyLParam(hotkey, true));
+}
+
+// Sends Ctrl+wheel messages, one per notch (positive zooms in). File Pilot
+// hit-tests the wheel against the previous frame's cursor, so a move to the
+// file list gets a few frames first, and the fake cursor must not lapse in
+// between.
+void WheelZoom(HWND hwnd, int notches) {
+    if (notches == 0) {
+        return;
+    }
+    POINT screenPoint = main_window::ListCenter();
+    POINT clientPoint = screenPoint;
+    ScreenToClient(hwnd, &clientPoint);
+    SHORT delta = notches > 0 ? WHEEL_DELTA : -WHEEL_DELTA;
+
+    fake_input::Begin();
+    PostMessageW(hwnd, WM_MOUSEMOVE, fake_input::kMouseTag,
+                 MAKELPARAM(clientPoint.x, clientPoint.y));
+    Sleep(kHoverSettleMs);
+    for (int i = 0; i < std::abs(notches); i++) {
+        PostMessageW(hwnd, WM_MOUSEWHEEL,
+                     MAKEWPARAM(MK_CONTROL | fake_input::kMouseTag, delta),
+                     MAKELPARAM(screenPoint.x, screenPoint.y));
+    }
+    fake_input::Wait();
+}
+
+}  // namespace synth
+
+// ===========================================================================
+// View records
+//
+// Finds File Pilot's view records by their shape (filepilot::ViewRecordHeader)
+// in writable private memory. Memory may be freed while it's read, so all
+// access goes through Read/WriteProcessMemory, which fail instead of
+// crashing. Used by the worker thread only.
+
+class ViewRecords {
+   public:
+    std::vector<uintptr_t> FindInKnownRegions() { return Scan(&regions_); }
+
+    std::vector<uintptr_t> FindEverywhere() { return Scan(nullptr); }
+
+    // Remembers the region holding a record: File Pilot keeps allocating new
+    // records in the same few regions.
+    void RememberRegionOf(uintptr_t record) {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery(reinterpret_cast<LPCVOID>(record), &info,
+                          sizeof(info))) {
+            return;
+        }
+        uintptr_t region = reinterpret_cast<uintptr_t>(info.BaseAddress);
+        if (std::find(regions_.begin(), regions_.end(), region) ==
+            regions_.end()) {
+            regions_.push_back(region);
+        }
     }
 
-    Settings settings;
-    {
-        std::lock_guard lock(g_settingsMutex);
-        settings = g_settings;
+    static bool ReadZoom(uintptr_t record, float* zoom) {
+        BYTE data[filepilot::kMaxRecordSize];
+        size_t read;
+        if (!ReadMemory(record, data, sizeof(data), &read) ||
+            !IsRecord(data, read)) {
+            return false;
+        }
+        memcpy(zoom, data, sizeof(*zoom));
+        return true;
     }
-    std::wstring normalized = NormalizePath(path);
-    if (IsExcluded(normalized, settings)) {
+
+    static bool WriteZoom(uintptr_t record, float zoom) {
+        SIZE_T written = 0;
+        return WriteProcessMemory(GetCurrentProcess(),
+                                  reinterpret_cast<LPVOID>(record), &zoom,
+                                  sizeof(zoom), &written) &&
+               written == sizeof(zoom);
+    }
+
+   private:
+    static constexpr size_t kChunkSize = 4 << 20;
+
+    static bool IsRecord(const BYTE* data, size_t available) {
+        using namespace filepilot;
+        if (available < sizeof(ViewRecordHeader)) {
+            return false;
+        }
+        ViewRecordHeader header;
+        memcpy(&header, data, sizeof(header));
+        // The column count rules out almost every offset, so it goes first.
+        if (header.columnCount < kMinRecordColumns ||
+            header.columnCount > kMaxRecordColumns) {
+            return false;
+        }
+        if (!(header.zoom >= 0.0f && header.zoom <= 1.0f) ||
+            header.sortedBy < 0 || header.sortedBy > kMaxSortedBy ||
+            available < sizeof(ViewRecordHeader) +
+                            header.columnCount * sizeof(ViewColumn)) {
+            return false;
+        }
+
+        float total = 0.0f;
+        uint64_t kindsSeen = 0;
+        for (int i = 0; i < header.columnCount; i++) {
+            ViewColumn column;
+            memcpy(&column,
+                   data + sizeof(ViewRecordHeader) + i * sizeof(ViewColumn),
+                   sizeof(column));
+            if (column.kind < 0 || column.kind > kMaxColumnKind ||
+                !(column.ratio > 0.0f && column.ratio <= 1.0f)) {
+                return false;
+            }
+            uint64_t kindBit = 1ull << column.kind;
+            if (kindsSeen & kindBit) {
+                return false;
+            }
+            kindsSeen |= kindBit;
+            total += column.ratio;
+        }
+        return std::fabs(total - 1.0f) < 0.02f;
+    }
+
+    static bool ReadMemory(uintptr_t address, void* buffer, size_t size,
+                           size_t* read) {
+        SIZE_T bytesRead = 0;
+        BOOL ok = ReadProcessMemory(GetCurrentProcess(),
+                                    reinterpret_cast<LPCVOID>(address), buffer,
+                                    size, &bytesRead);
+        *read = bytesRead;
+        return ok || bytesRead > 0;
+    }
+
+    static bool IsScannable(const MEMORY_BASIC_INFORMATION& info) {
+        return info.State == MEM_COMMIT && info.Type == MEM_PRIVATE &&
+               info.Protect == PAGE_READWRITE;
+    }
+
+    void ScanRegion(const MEMORY_BASIC_INFORMATION& info,
+                    std::vector<uintptr_t>& records) {
+        uintptr_t regionStart = reinterpret_cast<uintptr_t>(info.BaseAddress);
+        uintptr_t regionEnd = regionStart + info.RegionSize;
+        for (uintptr_t start = regionStart; start < regionEnd;
+             start += kChunkSize) {
+            // Chunks overlap by one record, so none is cut in two.
+            size_t size = std::min<size_t>(chunk_.size(), regionEnd - start);
+            size_t read;
+            if (!ReadMemory(start, chunk_.data(), size, &read)) {
+                continue;
+            }
+            size_t scanEnd = std::min(read, kChunkSize);
+            for (size_t i = 0; i < scanEnd; i += alignof(float)) {
+                if (IsRecord(&chunk_[i], read - i)) {
+                    records.push_back(start + i);
+                }
+            }
+        }
+    }
+
+    // Scans the regions with these base addresses, or all writable private
+    // memory when regions is null.
+    std::vector<uintptr_t> Scan(const std::vector<uintptr_t>* regions) {
+        ULONGLONG startTime = GetTickCount64();
+        if (chunk_.empty()) {
+            chunk_.resize(kChunkSize + filepilot::kMaxRecordSize);
+        }
+        std::vector<uintptr_t> records;
+        MEMORY_BASIC_INFORMATION info;
+        if (regions) {
+            for (uintptr_t region : *regions) {
+                if (VirtualQuery(reinterpret_cast<LPCVOID>(region), &info,
+                                 sizeof(info)) &&
+                    IsScannable(info)) {
+                    ScanRegion(info, records);
+                }
+            }
+        } else {
+            for (uintptr_t address = 0;
+                 VirtualQuery(reinterpret_cast<LPCVOID>(address), &info,
+                              sizeof(info));
+                 address = reinterpret_cast<uintptr_t>(info.BaseAddress) +
+                           info.RegionSize) {
+                if (IsScannable(info)) {
+                    ScanRegion(info, records);
+                }
+            }
+        }
+        Wh_Log(L"Found %zu view records in %llu ms (%s)", records.size(),
+               GetTickCount64() - startTime,
+               regions ? L"known regions" : L"all memory");
+        return records;
+    }
+
+    std::vector<BYTE> chunk_;
+    std::vector<uintptr_t> regions_;
+};
+
+ViewRecords g_viewRecords;
+
+// ===========================================================================
+// Layouts
+
+thread_local bool t_ownScan = false;
+
+Layout ClassifyFolder(const std::wstring& path, const Config& config) {
+    std::wstring pattern = path;
+    if (pattern.back() != L'\\') {
+        pattern += L'\\';
+    }
+    pattern += L'*';
+
+    // Our own listing must not end up in the directory log.
+    WIN32_FIND_DATAW data;
+    t_ownScan = true;
+    HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data,
+                                   FindExSearchNameMatch, nullptr,
+                                   FIND_FIRST_EX_LARGE_FETCH);
+    t_ownScan = false;
+    if (find == INVALID_HANDLE_VALUE) {
+        return {};
+    }
+
+    std::vector<int> counts(config.rules.size());
+    int files = 0, folders = 0;
+    std::wstring extension;
+    do {
+        const wchar_t* name = data.cFileName;
+        if (name[0] == L'.' &&
+            (name[1] == L'\0' || (name[1] == L'.' && name[2] == L'\0'))) {
+            continue;
+        }
+        if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            folders++;
+            continue;
+        }
+        if (data.dwFileAttributes &
+            (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)) {
+            continue;
+        }
+        files++;
+        const wchar_t* dot = wcsrchr(name, L'.');
+        if (!dot || !dot[1]) {
+            continue;
+        }
+        extension.assign(dot + 1);  // reuses its buffer across files
+        text::LowerInPlace(extension);
+        auto rule = config.ruleByExtension.find(extension);
+        if (rule != config.ruleByExtension.end()) {
+            counts[rule->second]++;
+        }
+    } while (files + folders < config.maxScan && FindNextFileW(find, &data));
+    FindClose(find);
+
+    if (files == 0) {
+        return {folders ? config.foldersOnlyView : View::None};
+    }
+    // Among templates reaching their own threshold, the most files wins.
+    size_t best = counts.size();
+    for (size_t i = 0; i < counts.size(); i++) {
+        bool qualifies = counts[i] * 100 >= config.rules[i].threshold * files;
+        if (qualifies && (best == counts.size() || counts[i] > counts[best])) {
+            best = i;
+        }
+    }
+    if (best == counts.size()) {
+        Wh_Log(L"%s: mixed (%d files)", path.c_str(), files);
+        return {config.mixedView};
+    }
+    Wh_Log(L"%s: %d/%d files match %s", path.c_str(), counts[best], files,
+           config.rules[best].name.c_str());
+    return config.rules[best].layout;
+}
+
+View NearestIconPreset(float zoom) {
+    View nearest = View::Medium;
+    for (View view : {View::Medium, View::Large, View::XL}) {
+        if (std::fabs(filepilot::kViewZoom[static_cast<int>(view)] - zoom) <
+            std::fabs(filepilot::kViewZoom[static_cast<int>(nearest)] - zoom)) {
+            nearest = view;
+        }
+    }
+    return nearest;
+}
+
+// The one record at exactly this zoom, or 0.
+uintptr_t FindOnlyRecordAt(const std::vector<uintptr_t>& records, float zoom) {
+    uintptr_t found = 0;
+    for (uintptr_t record : records) {
+        float recordZoom;
+        if (ViewRecords::ReadZoom(record, &recordZoom) && recordZoom == zoom) {
+            if (found) {
+                return 0;
+            }
+            found = record;
+        }
+    }
+    return found;
+}
+
+// Finds the current folder's record by pressing the nearest icon preset and
+// seeing which record takes its zoom, then writes the exact zoom there.
+bool SetZoomInMemory(HWND hwnd, const Config& config, int zoom) {
+    float targetZoom = zoom / 100.0f;
+    View preset = NearestIconPreset(targetZoom);
+    float presetZoom = filepilot::kViewZoom[static_cast<int>(preset)];
+
+    // Scan before pressing the preset, so the view doesn't sit at the preset
+    // while we search.
+    std::vector<uintptr_t> records = g_viewRecords.FindInKnownRegions();
+    if (records.empty()) {
+        records = g_viewRecords.FindEverywhere();
+    }
+    std::vector<std::pair<uintptr_t, float>> before;
+    before.reserve(records.size());
+    for (uintptr_t record : records) {
+        float recordZoom;
+        if (ViewRecords::ReadZoom(record, &recordZoom)) {
+            before.push_back({record, recordZoom});
+        }
+    }
+
+    synth::PressHotkey(hwnd, config.hotkeys[static_cast<int>(preset)]);
+
+    uintptr_t current = 0;
+    int changed = 0;
+    for (const auto& [record, oldZoom] : before) {
+        float newZoom;
+        if (ViewRecords::ReadZoom(record, &newZoom) && newZoom != oldZoom &&
+            newZoom == presetZoom) {
+            current = record;
+            changed++;
+        }
+    }
+    if (changed != 1) {
+        // The record may be outside the known regions, or the folder was
+        // already at the preset: look for the one record at the preset's zoom.
+        current = FindOnlyRecordAt(g_viewRecords.FindEverywhere(), presetZoom);
+        if (!current) {
+            Wh_Log(L"Can't tell the view record apart (%d changed)", changed);
+            return false;
+        }
+    }
+    g_viewRecords.RememberRegionOf(current);
+
+    if (!ViewRecords::WriteZoom(current, targetZoom)) {
+        return false;
+    }
+    // Wake File Pilot so it renders the new zoom.
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    Wh_Log(L"Zoom %d%% written to the view record at %p", zoom,
+           reinterpret_cast<void*>(current));
+    return true;
+}
+
+// Fallback: Ctrl+wheel up from Details (0%), in whole notches.
+void SetZoomWithWheel(HWND hwnd, const Config& config, int zoom) {
+    synth::PressHotkey(hwnd, config.hotkeys[static_cast<int>(View::Details)]);
+    synth::WheelZoom(
+        hwnd, static_cast<int>(std::lround(zoom / filepilot::kZoomPerWheelMessage)));
+}
+
+void ApplyLayout(HWND hwnd, const Config& config, const Layout& layout) {
+    if (layout.IsIconView() && layout.zoom > 0) {
+        if (!SetZoomInMemory(hwnd, config, layout.zoom)) {
+            Wh_Log(L"Falling back to Ctrl+wheel zoom");
+            SetZoomWithWheel(hwnd, config, layout.zoom);
+        }
+        return;
+    }
+    synth::PressHotkey(hwnd, config.hotkeys[static_cast<int>(layout.view)]);
+}
+
+// Picks and applies the layout for a folder. stillCurrent tells whether the
+// user is still in it.
+void ApplyFolderLayout(const std::wstring& path,
+                       const std::function<bool()>& stillCurrent) {
+    std::shared_ptr<const Config> config = config::Current();
+    std::wstring normalized = text::NormalizePath(path);
+    if (config->IsExcluded(normalized)) {
         return;
     }
 
     Layout layout;
-    if (settings.rememberManual) {
-        std::lock_guard lock(g_manualMutex);
-        auto it = g_manualViews.find(normalized);
-        if (it != g_manualViews.end()) {
-            layout.view = it->second;
+    if (config->rememberManual) {
+        layout.view = g_manualViews.Find(normalized);
+        if (layout.view != View::None) {
             Wh_Log(L"%s: remembered %s", path.c_str(), ViewName(layout.view));
         }
     }
     if (layout.view == View::None) {
-        layout = ClassifyFolder(path, settings);
+        layout = ClassifyFolder(path, *config);
     }
 
-    HWND hwnd = g_mainWnd;
-    if (layout.view == View::None || !hwnd || generation != g_navGeneration) {
+    HWND hwnd = main_window::Handle();
+    if (layout.view == View::None || !hwnd || !stillCurrent()) {
         Wh_Log(L"%s: leaving view as is", path.c_str());
         return;
     }
-    Wh_Log(L"%s: switching to %s, zoom %d", path.c_str(), ViewName(layout.view),
-           layout.zoom);
-    ApplyLayout(hwnd, layout);
+    Wh_Log(L"%s: switching to %s, zoom %d", path.c_str(),
+           ViewName(layout.view), layout.zoom);
+    ApplyLayout(hwnd, *config, layout);
 }
 
-void WorkerLoop() {
-    std::unique_lock lock(g_navMutex);
-    while (true) {
-        g_navCv.wait(lock, [] { return g_stopWorker || g_hasPending; });
-        if (g_stopWorker) {
+// ===========================================================================
+// Directory log
+//
+// Directories File Pilot opened lately, so a title that only shows a path's
+// tail can be resolved. File Pilot opens folders constantly while sizing
+// them, so recording reuses a fixed ring of strings and doesn't allocate once
+// warmed up.
+
+class DirectoryLog {
+   public:
+    // Records "C:\dir" from a directory path or a listing pattern such as
+    // "\\?\C:\dir\*".
+    void Record(LPCWSTR pathOrPattern) {
+        if (!pathOrPattern || t_ownScan) {
             return;
         }
-        std::wstring path = g_pendingPath;
-        g_hasPending = false;
-        unsigned generation = g_navGeneration;
-        lock.unlock();
-        ApplyView(path, generation);
-        lock.lock();
+        thread_local std::wstring dir;
+        if (!ToDirectory(pathOrPattern, dir)) {
+            return;
+        }
+
+        std::lock_guard lock(mutex_);
+        size_t last = (next_ + kCapacity - 1) % kCapacity;
+        if (count_ && entries_[last] == dir) {
+            return;
+        }
+        entries_[next_].assign(dir);
+        next_ = (next_ + 1) % kCapacity;
+        count_ = std::min(count_ + 1, kCapacity);
+    }
+
+    // The newest directory whose path ends with "\<tail>".
+    std::wstring FindByTail(const std::wstring& tail) {
+        std::wstring needle = L"\\" + tail;
+        std::replace(needle.begin(), needle.end(), L'/', L'\\');
+        std::lock_guard lock(mutex_);
+        for (size_t i = 1; i <= count_; i++) {
+            const std::wstring& entry =
+                entries_[(next_ + kCapacity - i) % kCapacity];
+            if (entry.size() > needle.size() &&
+                text::EndsWithNoCase(entry, needle)) {
+                return entry;
+            }
+        }
+        return {};
+    }
+
+   private:
+    static constexpr size_t kCapacity = 256;
+
+    static bool ToDirectory(LPCWSTR pathOrPattern, std::wstring& dir) {
+        dir.assign(pathOrPattern);
+        if (dir.find_first_of(L"*?") != std::wstring::npos) {
+            size_t slash = dir.find_last_of(L"\\/");
+            if (slash == std::wstring::npos) {
+                return false;
+            }
+            dir.resize(slash + 1);
+        }
+        std::replace(dir.begin(), dir.end(), L'/', L'\\');
+        if (dir.rfind(L"\\\\?\\UNC\\", 0) == 0) {
+            dir.erase(2, 6);  // "\\?\UNC\server" -> "\\server"
+        } else if (dir.rfind(L"\\\\?\\", 0) == 0) {
+            dir.erase(0, 4);
+        }
+        while (dir.size() > 3 && dir.back() == L'\\') {
+            dir.pop_back();  // keep "C:\" for drive roots
+        }
+        return text::IsAbsolutePath(dir);
+    }
+
+    std::mutex mutex_;
+    std::array<std::wstring, kCapacity> entries_;
+    size_t next_ = 0;
+    size_t count_ = 0;
+};
+
+DirectoryLog g_directoryLog;
+
+// ===========================================================================
+// Navigator
+//
+// Tracks the folder shown in the title and hands each new one to a worker
+// thread, which resolves its full path and applies its layout. A generation
+// number lets the worker drop folders the user has already left.
+
+class Navigator {
+   public:
+    void Start() { worker_ = std::thread(&Navigator::Run, this); }
+
+    void Stop() {
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        wake_.notify_one();
+        if (worker_.joinable()) {
+            worker_.join();
+        }
+    }
+
+    // apply: false only records the folder, for the title found at startup.
+    void OnTitle(PCWSTR title, bool apply) {
+        std::wstring path = PathFromTitle(title);
+        std::lock_guard lock(mutex_);
+        if (path == titlePath_) {
+            return;
+        }
+        titlePath_ = path;
+        resolvedPath_ = text::IsAbsolutePath(path) ? path : L"";
+        if (!resolvedPath_.empty()) {
+            lastResolvedPath_ = resolvedPath_;
+        }
+        generation_++;
+        if (apply && !path.empty()) {
+            pendingPath_ = path;
+            hasPending_ = true;
+            wake_.notify_one();
+        }
+    }
+
+    // The current folder's full path, or empty while it's unknown.
+    std::wstring CurrentFolder() {
+        std::lock_guard lock(mutex_);
+        return resolvedPath_;
+    }
+
+    std::wstring TitlePath() {
+        std::lock_guard lock(mutex_);
+        return titlePath_;
+    }
+
+   private:
+    static constexpr int kResolveAttempts = 20;
+    static constexpr DWORD kResolveRetryMs = 50;
+
+    static std::wstring PathFromTitle(const std::wstring& title) {
+        size_t suffix = title.rfind(filepilot::kTitleSuffix);
+        if (suffix == std::wstring::npos || suffix < 2 ||
+            title[suffix - 1] != L')') {
+            return {};
+        }
+        std::wstring head = title.substr(0, suffix - 1);
+        std::wstring fallback;
+        for (size_t open = head.find(L" ("); open != std::wstring::npos;
+             open = head.find(L" (", open + 1)) {
+            std::wstring path = head.substr(open + 2);
+            std::wstring last = text::LastComponent(path);
+            if (text::EqualsNoCase(last.data(), last.size(), head.data(),
+                                   open)) {
+                return path;
+            }
+            if (fallback.empty() && text::IsAbsolutePath(path)) {
+                fallback = path;
+            }
+        }
+        return fallback;
+    }
+
+    static bool IsDirectory(const std::wstring& path) {
+        DWORD attributes = GetFileAttributesW(path.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES &&
+               (attributes & FILE_ATTRIBUTE_DIRECTORY);
+    }
+
+    // Navigation mostly stays in one tree, so try "<ancestor of the last
+    // folder>\<tail>" from the deepest ancestor up.
+    static std::wstring FindUnderFolder(const std::wstring& tail,
+                                        std::wstring ancestor) {
+        while (!ancestor.empty()) {
+            std::wstring candidate = ancestor;
+            if (candidate.back() != L'\\') {
+                candidate += L'\\';
+            }
+            candidate += tail;
+            if (IsDirectory(candidate)) {
+                return candidate;
+            }
+            size_t slash = ancestor.find_last_of(L'\\', ancestor.size() - 2);
+            if (slash == std::wstring::npos) {
+                break;
+            }
+            ancestor.resize(slash + 1);
+        }
+        return {};
+    }
+
+    bool IsCurrent(unsigned generation) {
+        std::lock_guard lock(mutex_);
+        return generation == generation_;
+    }
+
+    // Turns a title path into a full path, giving File Pilot a moment to
+    // open the folder when the title only shows its tail.
+    std::wstring Resolve(const std::wstring& titlePath, unsigned generation) {
+        if (text::IsAbsolutePath(titlePath)) {
+            return titlePath;
+        }
+        std::wstring lastFolder;
+        {
+            std::lock_guard lock(mutex_);
+            lastFolder = lastResolvedPath_;
+        }
+        std::wstring path = FindUnderFolder(titlePath, lastFolder);
+        for (int i = 0;
+             path.empty() && i < kResolveAttempts && IsCurrent(generation);
+             i++) {
+            path = g_directoryLog.FindByTail(titlePath);
+            if (path.empty()) {
+                Sleep(kResolveRetryMs);
+            }
+        }
+        if (path.empty()) {
+            Wh_Log(L"Can't resolve %s", titlePath.c_str());
+        }
+        return path;
+    }
+
+    void Process(const std::wstring& titlePath, unsigned generation) {
+        std::wstring path = Resolve(titlePath, generation);
+        if (path.empty()) {
+            return;
+        }
+        {
+            std::lock_guard lock(mutex_);
+            if (generation != generation_) {
+                return;
+            }
+            resolvedPath_ = path;
+            lastResolvedPath_ = path;
+        }
+        ApplyFolderLayout(path, [&] { return IsCurrent(generation); });
+    }
+
+    void Run() {
+        std::unique_lock lock(mutex_);
+        while (true) {
+            wake_.wait(lock, [this] { return stop_ || hasPending_; });
+            if (stop_) {
+                return;
+            }
+            std::wstring path = pendingPath_;
+            unsigned generation = generation_;
+            hasPending_ = false;
+            lock.unlock();
+            Process(path, generation);
+            lock.lock();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::thread worker_;
+    bool stop_ = false;
+    std::wstring titlePath_;         // as shown in the title, maybe a tail
+    std::wstring resolvedPath_;      // the current folder's full path
+    std::wstring lastResolvedPath_;  // kept across folder changes
+    std::wstring pendingPath_;
+    bool hasPending_ = false;
+    unsigned generation_ = 0;
+};
+
+Navigator g_navigator;
+
+// ===========================================================================
+// Hooks
+
+using SetWindowTextW_t = decltype(&SetWindowTextW);
+using GetKeyState_t = decltype(&GetKeyState);
+using PeekMessageW_t = decltype(&PeekMessageW);
+using TranslateMessage_t = decltype(&TranslateMessage);
+using GetCursorPos_t = decltype(&GetCursorPos);
+using WindowFromPoint_t = decltype(&WindowFromPoint);
+using CreateFileW_t = decltype(&CreateFileW);
+using FindFirstFileW_t = decltype(&FindFirstFileW);
+using FindFirstFileExW_t = decltype(&FindFirstFileExW);
+
+SetWindowTextW_t SetWindowTextW_Original;
+GetKeyState_t GetKeyState_Original;
+PeekMessageW_t PeekMessageW_Original;
+TranslateMessage_t TranslateMessage_Original;
+GetCursorPos_t GetCursorPos_Original;
+WindowFromPoint_t WindowFromPoint_Original;
+CreateFileW_t CreateFileW_Original;
+FindFirstFileW_t FindFirstFileW_Original;
+FindFirstFileExW_t FindFirstFileExW_Original;
+
+bool IsRealKeyDown(int vk) {
+    return GetKeyState_Original(vk) & 0x8000;
+}
+
+// A real View hotkey press: remember the user's choice for this folder.
+void RememberManualView(const MSG& msg) {
+    bool isFirstKeyDown =
+        (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) &&
+        !(msg.lParam & 0x40000000);
+    if (!isFirstKeyDown) {
+        return;
+    }
+    std::shared_ptr<const Config> config = config::Current();
+    if (!config->rememberManual) {
+        return;
+    }
+    for (int i = 0; i < kViewCount; i++) {
+        const Hotkey& hotkey = config->hotkeys[i];
+        if (hotkey.vk != msg.wParam ||
+            hotkey.ctrl != IsRealKeyDown(VK_CONTROL) ||
+            hotkey.shift != IsRealKeyDown(VK_SHIFT) ||
+            hotkey.alt != IsRealKeyDown(VK_MENU)) {
+            continue;
+        }
+        std::wstring folder = g_navigator.CurrentFolder();
+        if (!folder.empty()) {
+            View view = static_cast<View>(i);
+            Wh_Log(L"Remembering %s for %s", ViewName(view), folder.c_str());
+            g_manualViews.Remember(text::NormalizePath(folder), view);
+        }
+        return;
     }
 }
 
-// ---------------------------------------------------------------------------
-// Hooks
-
 BOOL WINAPI SetWindowTextW_Hook(HWND hwnd, LPCWSTR text) {
     BOOL result = SetWindowTextW_Original(hwnd, text);
-    if (text && IsMainWindow(hwnd)) {
-        OnTitleChanged(text, true);
+    if (text && main_window::Is(hwnd)) {
+        g_navigator.OnTitle(text, true);
     }
     return result;
 }
 
-HANDLE WINAPI FindFirstFileW_Hook(LPCWSTR fileName,
-                                  LPWIN32_FIND_DATAW findData) {
-    HANDLE find = FindFirstFileW_Original(fileName, findData);
-    if (find != INVALID_HANDLE_VALUE) {
-        RecordListedDir(fileName);
+SHORT WINAPI GetKeyState_Hook(int vk) {
+    SHORT state = GetKeyState_Original(vk);
+    if (fake_input::IsModifierFaked(vk)) {
+        state |= static_cast<SHORT>(0x8000);
     }
-    return find;
+    return state;
+}
+
+BOOL WINAPI GetCursorPos_Hook(LPPOINT point) {
+    if (point && fake_input::IsCursorFaked()) {
+        *point = main_window::ListCenter();
+        return TRUE;
+    }
+    return GetCursorPos_Original(point);
+}
+
+HWND WINAPI WindowFromPoint_Hook(POINT point) {
+    if (fake_input::IsCursorFaked()) {
+        return main_window::Handle();
+    }
+    return WindowFromPoint_Original(point);
+}
+
+BOOL WINAPI PeekMessageW_Hook(LPMSG msg,
+                              HWND hwnd,
+                              UINT filterMin,
+                              UINT filterMax,
+                              UINT removeMsg) {
+    bool isUiThread = main_window::IsUiThread();
+    if (isUiThread) {
+        fake_input::OnFrameDone();
+    }
+    BOOL result =
+        PeekMessageW_Original(msg, hwnd, filterMin, filterMax, removeMsg);
+    if (result && (removeMsg & PM_REMOVE) && msg->hwnd &&
+        msg->hwnd == main_window::Handle()) {
+        if (!fake_input::OnMessage(*msg)) {
+            RememberManualView(*msg);
+        }
+    } else if (!result && isUiThread) {
+        fake_input::OnQueueDrained();
+    }
+    return result;
+}
+
+BOOL WINAPI TranslateMessage_Hook(const MSG* msg) {
+    // Our keys must not turn into typed characters (e.g. into the filter box).
+    if (msg && fake_input::IsTaggedKey(*msg)) {
+        return TRUE;
+    }
+    return TranslateMessage_Original(msg);
 }
 
 // Folders are opened with backup semantics to be listed or watched.
@@ -1177,9 +1581,18 @@ HANDLE WINAPI CreateFileW_Hook(LPCWSTR fileName,
                                        flagsAndAttributes, templateFile);
     if (file != INVALID_HANDLE_VALUE &&
         (flagsAndAttributes & FILE_FLAG_BACKUP_SEMANTICS)) {
-        RecordListedDir(fileName);
+        g_directoryLog.Record(fileName);
     }
     return file;
+}
+
+HANDLE WINAPI FindFirstFileW_Hook(LPCWSTR fileName,
+                                  LPWIN32_FIND_DATAW findData) {
+    HANDLE find = FindFirstFileW_Original(fileName, findData);
+    if (find != INVALID_HANDLE_VALUE) {
+        g_directoryLog.Record(fileName);
+    }
+    return find;
 }
 
 HANDLE WINAPI FindFirstFileExW_Hook(LPCWSTR fileName,
@@ -1188,241 +1601,107 @@ HANDLE WINAPI FindFirstFileExW_Hook(LPCWSTR fileName,
                                     FINDEX_SEARCH_OPS searchOp,
                                     LPVOID searchFilter,
                                     DWORD additionalFlags) {
-    HANDLE find = FindFirstFileExW_Original(fileName, infoLevel, findData,
-                                            searchOp, searchFilter,
-                                            additionalFlags);
+    HANDLE find =
+        FindFirstFileExW_Original(fileName, infoLevel, findData, searchOp,
+                                  searchFilter, additionalFlags);
     if (find != INVALID_HANDLE_VALUE) {
-        RecordListedDir(fileName);
+        g_directoryLog.Record(fileName);
     }
     return find;
 }
 
-bool IsFakedModifier(int vk, int mods) {
-    switch (vk) {
-        case VK_CONTROL:
-        case VK_LCONTROL:
-            return mods & kModCtrl;
-        case VK_SHIFT:
-        case VK_LSHIFT:
-            return mods & kModShift;
-        case VK_MENU:
-        case VK_LMENU:
-            return mods & kModAlt;
-    }
-    return false;
-}
+struct HookSpec {
+    PCWSTR module;
+    const char* function;
+    void* hook;
+    void** original;
+};
 
-void EndFakeInput() {
-    g_fakeMods = 0;
-    g_fakeCursor = false;
-    g_fakePhase = kFakeIdle;
-}
+const HookSpec kHooks[] = {
+    {L"user32.dll", "SetWindowTextW", reinterpret_cast<void*>(SetWindowTextW_Hook),
+     reinterpret_cast<void**>(&SetWindowTextW_Original)},
+    {L"user32.dll", "GetKeyState", reinterpret_cast<void*>(GetKeyState_Hook),
+     reinterpret_cast<void**>(&GetKeyState_Original)},
+    {L"user32.dll", "PeekMessageW", reinterpret_cast<void*>(PeekMessageW_Hook),
+     reinterpret_cast<void**>(&PeekMessageW_Original)},
+    {L"user32.dll", "TranslateMessage",
+     reinterpret_cast<void*>(TranslateMessage_Hook),
+     reinterpret_cast<void**>(&TranslateMessage_Original)},
+    {L"user32.dll", "GetCursorPos", reinterpret_cast<void*>(GetCursorPos_Hook),
+     reinterpret_cast<void**>(&GetCursorPos_Original)},
+    {L"user32.dll", "WindowFromPoint",
+     reinterpret_cast<void*>(WindowFromPoint_Hook),
+     reinterpret_cast<void**>(&WindowFromPoint_Original)},
+    {L"kernelbase.dll", "CreateFileW", reinterpret_cast<void*>(CreateFileW_Hook),
+     reinterpret_cast<void**>(&CreateFileW_Original)},
+    {L"kernelbase.dll", "FindFirstFileW",
+     reinterpret_cast<void*>(FindFirstFileW_Hook),
+     reinterpret_cast<void**>(&FindFirstFileW_Original)},
+    {L"kernelbase.dll", "FindFirstFileExW",
+     reinterpret_cast<void*>(FindFirstFileExW_Hook),
+     reinterpret_cast<void**>(&FindFirstFileExW_Original)},
+};
 
-bool IsFakingInput() {
-    int phase = g_fakePhase;
-    if (phase != kFakeDelivered && phase != kFakeQueueDrained) {
-        return false;
-    }
-    if (GetTickCount64() - g_fakeSince > kFakeInputMaxMs) {
-        EndFakeInput();
-        return false;
+bool InstallHooks() {
+    for (const HookSpec& spec : kHooks) {
+        HMODULE module = GetModuleHandleW(spec.module);
+        void* target =
+            module ? reinterpret_cast<void*>(GetProcAddress(module, spec.function))
+                   : nullptr;
+        if (!target) {
+            Wh_Log(L"Missing %s!%S", spec.module, spec.function);
+            return false;
+        }
+        if (!Wh_SetFunctionHook(target, spec.hook, spec.original)) {
+            Wh_Log(L"Can't hook %s!%S", spec.module, spec.function);
+            return false;
+        }
     }
     return true;
 }
 
-SHORT WINAPI GetKeyState_Hook(int vk) {
-    SHORT state = GetKeyState_Original(vk);
-    int mods = g_fakeMods;
-    if (mods && IsFakingInput() && IsFakedModifier(vk, mods)) {
-        state |= (SHORT)0x8000;
-    }
-    return state;
-}
-
-BOOL WINAPI GetCursorPos_Hook(LPPOINT point) {
-    if (point && g_fakeCursor && IsFakingInput()) {
-        *point = FakeCursorPos();
-        return TRUE;
-    }
-    return GetCursorPos_Original(point);
-}
-
-HWND WINAPI WindowFromPoint_Hook(POINT point) {
-    if (g_fakeCursor && IsFakingInput()) {
-        return g_mainWnd;
-    }
-    return WindowFromPoint_Original(point);
-}
-
-bool IsRealKeyDown(int vk) {
-    return GetKeyState_Original(vk) & 0x8000;
-}
-
-void FakeInput(int mods, bool cursor, ULONGLONG holdMs) {
-    g_fakeSince = GetTickCount64();
-    g_fakeHoldMs = holdMs;
-    g_fakeMods = mods;
-    g_fakeCursor = cursor;
-    g_fakePhase = kFakeDelivered;
-}
-
-bool IsTaggedKey(const MSG& msg) {
-    return msg.message >= WM_KEYFIRST && msg.message <= WM_KEYLAST &&
-           (msg.lParam & kKeyMark);
-}
-
-void InspectInputMessage(const MSG& msg) {
-    if (msg.message == WM_MOUSEWHEEL || msg.message == WM_MOUSEMOVE) {
-        WORD keys = GET_KEYSTATE_WPARAM(msg.wParam);
-        if (keys & kMouseMark) {
-            FakeInput((keys & MK_CONTROL ? kModCtrl : 0) |
-                          (keys & MK_SHIFT ? kModShift : 0),
-                      true, kWheelHoldMs);
-        }
-        return;
-    }
-
-    bool isDown = msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN;
-    bool isUp = msg.message == WM_KEYUP || msg.message == WM_SYSKEYUP;
-    if (!isDown && !isUp) {
-        return;
-    }
-
-    if (IsTaggedKey(msg)) {
-        FakeInput((msg.lParam >> kKeyModsShift) & 7, false, 0);
-        return;
-    }
-
-    // A real View hotkey press: remember the user's choice for this folder.
-    if (!isDown || (msg.lParam & 0x40000000)) {
-        return;
-    }
-    for (int i = 0; i < (int)View::Count; i++) {
-        const Hotkey& hotkey = g_hotkeys[i];
-        if (hotkey.vk == msg.wParam && hotkey.ctrl == IsRealKeyDown(VK_CONTROL) &&
-            hotkey.shift == IsRealKeyDown(VK_SHIFT) &&
-            hotkey.alt == IsRealKeyDown(VK_MENU)) {
-            RecordManualView((View)i);
-            return;
-        }
-    }
-}
-
-// File Pilot drains its queue, runs a frame, then peeks again. Fake input
-// for a tagged message ends when that frame is done.
-BOOL WINAPI PeekMessageW_Hook(LPMSG msg, HWND hwnd, UINT filterMin,
-                              UINT filterMax, UINT removeMsg) {
-    bool isMainThread = GetCurrentThreadId() == g_mainThreadId;
-    if (isMainThread && g_fakePhase == kFakeQueueDrained &&
-        GetTickCount64() - g_fakeSince >= g_fakeHoldMs) {
-        EndFakeInput();
-    }
-    BOOL result =
-        PeekMessageW_Original(msg, hwnd, filterMin, filterMax, removeMsg);
-    if (result && (removeMsg & PM_REMOVE) && msg->hwnd &&
-        msg->hwnd == g_mainWnd) {
-        InspectInputMessage(*msg);
-    } else if (!result && isMainThread && g_fakePhase == kFakeDelivered) {
-        g_fakePhase = kFakeQueueDrained;
-    }
-    return result;
-}
-
-BOOL WINAPI TranslateMessage_Hook(const MSG* msg) {
-    // Our keys must not turn into typed characters (e.g. into the filter box).
-    if (msg && IsTaggedKey(*msg)) {
-        return TRUE;
-    }
-    return TranslateMessage_Original(msg);
-}
-
-// ---------------------------------------------------------------------------
-// Mod lifecycle
-
 BOOL CALLBACK FindMainWindow(HWND hwnd, LPARAM) {
     DWORD processId;
     GetWindowThreadProcessId(hwnd, &processId);
-    if (processId != GetCurrentProcessId() || !IsMainWindow(hwnd)) {
+    if (processId != GetCurrentProcessId() || !main_window::Is(hwnd)) {
         return TRUE;
     }
     wchar_t title[1024];
     if (GetWindowTextW(hwnd, title, ARRAYSIZE(title))) {
-        OnTitleChanged(title, false);
+        g_navigator.OnTitle(title, false);
     }
     return FALSE;
 }
 
-template <typename T>
-bool HookExport(HMODULE module, const char* name, void* hook, T* original) {
-    void* target = module ? (void*)GetProcAddress(module, name) : nullptr;
-    if (!target) {
-        Wh_Log(L"Missing export %S", name);
-        return false;
-    }
-    return Wh_SetFunctionHook(target, hook, (void**)original);
-}
+}  // namespace
+
+// ===========================================================================
+// Mod lifecycle
 
 BOOL Wh_ModInit() {
-    LoadSettings();
-    LoadHotkeys();
-    LoadManualViews();
-
-    HMODULE user32 = GetModuleHandleW(L"user32.dll");
-    HMODULE kernelBase = GetModuleHandleW(L"kernelbase.dll");
-    if (!HookExport(user32, "SetWindowTextW", (void*)SetWindowTextW_Hook,
-                    &SetWindowTextW_Original) ||
-        !HookExport(user32, "GetKeyState", (void*)GetKeyState_Hook,
-                    &GetKeyState_Original) ||
-        !HookExport(user32, "PeekMessageW", (void*)PeekMessageW_Hook,
-                    &PeekMessageW_Original) ||
-        !HookExport(user32, "TranslateMessage", (void*)TranslateMessage_Hook,
-                    &TranslateMessage_Original) ||
-        !HookExport(user32, "GetCursorPos", (void*)GetCursorPos_Hook,
-                    &GetCursorPos_Original) ||
-        !HookExport(user32, "WindowFromPoint", (void*)WindowFromPoint_Hook,
-                    &WindowFromPoint_Original) ||
-        !HookExport(kernelBase, "FindFirstFileW", (void*)FindFirstFileW_Hook,
-                    &FindFirstFileW_Original) ||
-        !HookExport(kernelBase, "FindFirstFileExW", (void*)FindFirstFileExW_Hook,
-                    &FindFirstFileExW_Original) ||
-        !HookExport(kernelBase, "CreateFileW", (void*)CreateFileW_Hook,
-                    &CreateFileW_Original)) {
+    config::Reload();
+    g_manualViews.Load();
+    if (!InstallHooks()) {
         return FALSE;
     }
-
-    g_worker = std::thread(WorkerLoop);
+    g_navigator.Start();
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
     EnumWindows(FindMainWindow, 0);
-    std::lock_guard lock(g_navMutex);
-    Wh_Log(L"Main window %p, folder %s", (HWND)g_mainWnd, g_titlePath.c_str());
+    Wh_Log(L"Main window %p, folder %s", main_window::Handle(),
+           g_navigator.TitlePath().c_str());
 }
 
 void Wh_ModUninit() {
-    {
-        std::lock_guard lock(g_navMutex);
-        g_stopWorker = true;
-    }
-    g_navCv.notify_one();
-    if (g_worker.joinable()) {
-        g_worker.join();
-    }
-    EndFakeInput();
+    g_navigator.Stop();
+    fake_input::End();
 }
 
 void Wh_ModSettingsChanged() {
-    LoadSettings();
-    LoadHotkeys();
-    bool rememberManual;
-    {
-        std::lock_guard lock(g_settingsMutex);
-        rememberManual = g_settings.rememberManual;
-    }
-    if (!rememberManual) {
-        std::lock_guard lock(g_manualMutex);
-        g_manualViews.clear();
-        SaveManualViews();
+    config::Reload();
+    if (!config::Current()->rememberManual) {
+        g_manualViews.Clear();
     }
 }
