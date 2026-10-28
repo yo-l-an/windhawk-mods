@@ -13,39 +13,54 @@
 /*
 # File Pilot Auto View
 
-Picks a view mode for each folder you open in File Pilot, based on the files
-inside it. A folder that is mostly images opens in extra large icons, mostly
-videos in large icons, mostly documents in details, and so on.
+![File Pilot Auto View demo](https://raw.githubusercontent.com/yo-l-an/assets/main/windhawk-mods/filepilot-auto-view/demo.gif)
 
-## How it works
-- Hooks `SetWindowTextW` to read the current folder from the window title.
-- Scans the folder's file names and matches their extensions against the
-  templates in the settings.
-- Presses the matching View hotkey from `FPilot-Config.json`
-  (Ctrl+Shift+1..6 by default) inside the process. `GetKeyState` is hooked so
-  File Pilot sees the modifiers without touching your real keyboard.
-- For a custom icon zoom, finds the folder's view record in memory and writes
-  the exact zoom there, without opening File Pilot's view popover. The first
-  time in a session it presses the nearest icon view to learn where records
-  live, which shows the popover once. If the record can't be found, it
-  switches to Details (0%) and sends Ctrl+wheel notches (5.5% each) with the
-  cursor faked over the list.
-- Long paths are shortened in the title, so the full path is recovered from
-  the folders File Pilot opens.
+Opens each folder in [File Pilot](https://filepilot.tech) with a view that
+suits what's inside, like Windows Explorer does for picture folders.
 
-## Manual control
-- Switching view with a View hotkey remembers that view for the folder, so
-  the template no longer overrides it there. Turn off "Remember views picked
-  with hotkeys" to forget all remembered views.
-- Views picked with the mouse are not remembered; the template is re-applied
-  the next time you open the folder.
-- Add folders to "Excluded folders" to leave them alone.
-- Disable the mod in Windhawk to turn detection off entirely.
+## How folders are matched
+Each folder you open is matched against templates, by file type:
+
+| Template | View |
+|---|---|
+| Images | Medium icons at 45% |
+| Videos | Medium icons at 45% |
+| Documents | Tree |
+
+- A template wins when its file types make up at least 60% of the folder's
+  files. If several qualify, the one with the most files wins.
+- Mixed folders, and folders holding only subfolders, keep the view File
+  Pilot saved for them.
+- The mod reads the first 2000 items of a folder, which keeps large folders
+  quick to open.
+
+All of this is adjustable in Settings: each template's file types, view, zoom
+and threshold, extra templates of your own, the number of items read, and
+folders to leave alone.
+
+### Your choices come first
+- A view you pick with a File Pilot View shortcut sticks to that folder, and
+  its template stops applying there. Turn off "Remember views picked with
+  hotkeys" to clear them all.
+- A view you pick with the mouse lasts until you leave the folder; the
+  template applies again on your next visit.
 
 ## Limitations
-Relies on File Pilot's window title format (`Name (Path) - File Pilot vX`),
-its View hotkey commands and the layout of its view records in memory. A File
-Pilot update that changes any of them may break it.
+- The first icon zoom after File Pilot starts, and sometimes the first in a
+  new tab, briefly flashes File Pilot's view menu in the bottom-right corner.
+  Later folders switch without it.
+- When the mod can't set the zoom directly, it zooms the way Ctrl+scroll does,
+  in 5.5% steps, so 45% becomes 44%.
+
+## Compatibility
+Tested with File Pilot 0.8.5 on Windows 10.
+
+File Pilot has no plugin system, so the mod relies on details that can change
+between versions: the window title, the View shortcuts and how File Pilot
+stores zoom. Your shortcuts are read from File Pilot's own settings, so
+remapping them is fine. If an update changes the rest, folders stop switching
+views or icon zoom becomes approximate; turning the mod off in Windhawk
+brings File Pilot back to normal. Check for a mod update when that happens.
 */
 // ==/WindhawkModReadme==
 
