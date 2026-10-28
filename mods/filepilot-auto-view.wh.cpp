@@ -1349,6 +1349,14 @@ DirectoryLog g_directoryLog;
 
 class Navigator {
    public:
+    // When File Pilot exits, the mod is unloaded without Wh_ModUninit and its
+    // threads are already gone; destroying a joinable thread would abort().
+    ~Navigator() {
+        if (worker_.joinable()) {
+            worker_.detach();
+        }
+    }
+
     void Start() { worker_ = std::thread(&Navigator::Run, this); }
 
     void Stop() {
