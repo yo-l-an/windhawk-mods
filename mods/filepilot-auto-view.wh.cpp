@@ -7,6 +7,7 @@
 // @github          https://github.com/yo-l-an
 // @license         MIT
 // @include         FPilot.exe
+// @compilerOptions -lshell32 -lole32 -luuid
 // ==/WindhawkMod==
 // ==WindhawkModReadme==
 /*
@@ -153,7 +154,7 @@ File Pilot back to normal, and check for a mod update.
 //   synth        posting hotkeys and wheel zoom to File Pilot
 //   ViewRecords  finding and writing File Pilot's view records in memory
 //   layouts      classifying a folder and applying its layout
-//   DirectoryLog, Navigator   which folder is shown, and the worker thread
+//   Navigator    which folder is shown, and the worker thread
 //   hooks, lifecycle
 
 #include <algorithm>
@@ -171,6 +172,8 @@ File Pilot back to normal, and check for a mod update.
 #include <unordered_map>
 #include <vector>
 
+#include <shlobj.h>
+
 namespace {
 
 enum class View { None = -1, Details, Tree, List, Medium, Large, XL, Count };
@@ -182,8 +185,9 @@ constexpr int kViewCount = static_cast<int>(View::Count);
 namespace filepilot {
 
 constexpr wchar_t kWindowClass[] = L"File Pilot";
-// Titles read "<name> (<path>) - File Pilot v0.8.5". Long paths lose their
-// leading folders: "photos (Local\Temp\x\photos) - File Pilot v0.8.5".
+// Titles read "<name> (<path>) - File Pilot v0.8.5". Under the user's
+// profile, Desktop, and AppData's Local and Roaming, the path starts at that
+// folder: "photos (Local\Temp\x\photos) - File Pilot v0.8.5".
 constexpr wchar_t kTitleSuffix[] = L" - File Pilot";
 constexpr wchar_t kConfigFile[] =
     L"%APPDATA%\\Voidstar\\FilePilot\\FPilot-Config.json";
@@ -257,12 +261,6 @@ bool EqualsNoCase(const wchar_t* a, size_t aLength, const wchar_t* b,
                   size_t bLength) {
     return CompareStringOrdinal(a, static_cast<int>(aLength), b,
                                 static_cast<int>(bLength), TRUE) == CSTR_EQUAL;
-}
-
-bool EndsWithNoCase(const std::wstring& s, const std::wstring& suffix) {
-    return s.size() >= suffix.size() &&
-           EqualsNoCase(s.data() + s.size() - suffix.size(), suffix.size(),
-                        suffix.data(), suffix.size());
 }
 
 // Lowercase, backslashes, no trailing separator (except "c:\"): the form
@@ -1240,8 +1238,6 @@ ViewRecords g_viewRecords;
 // ===========================================================================
 // Layouts
 
-thread_local bool t_ownScan = false;
-
 Layout ClassifyFolder(const std::wstring& path, const Config& config) {
     std::wstring pattern = path;
     if (pattern.back() != L'\\') {
@@ -1249,13 +1245,10 @@ Layout ClassifyFolder(const std::wstring& path, const Config& config) {
     }
     pattern += L'*';
 
-    // Our own listing must not end up in the directory log.
     WIN32_FIND_DATAW data;
-    t_ownScan = true;
     HANDLE find = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &data,
                                    FindExSearchNameMatch, nullptr,
                                    FIND_FIRST_EX_LARGE_FETCH);
-    t_ownScan = false;
     if (find == INVALID_HANDLE_VALUE) {
         return {};
     }
@@ -1558,89 +1551,6 @@ void ApplyFolderLayout(const std::wstring& path,
 }
 
 // ===========================================================================
-// Directory log
-//
-// Directories File Pilot opened lately, so a title that only shows a path's
-// tail can be resolved. File Pilot opens tens of thousands of folders while
-// sizing them, so recording rejects most of them with a bounded length check
-// before any copy or lock, and reuses a fixed ring of strings.
-
-class DirectoryLog {
-   public:
-    // Records "C:\dir" from a directory path or a listing pattern such as
-    // "\\?\C:\dir\*".
-    void Record(LPCWSTR pathOrPattern) {
-        if (!pathOrPattern || t_ownScan ||
-            wcsnlen(pathOrPattern, kMinLength) < kMinLength) {
-            return;
-        }
-        thread_local std::wstring dir;
-        if (!ToDirectory(pathOrPattern, dir)) {
-            return;
-        }
-
-        std::lock_guard lock(mutex_);
-        size_t last = (next_ + kCapacity - 1) % kCapacity;
-        if (count_ && entries_[last] == dir) {
-            return;
-        }
-        entries_[next_].assign(dir);
-        next_ = (next_ + 1) % kCapacity;
-        count_ = std::min(count_ + 1, kCapacity);
-    }
-
-    // The newest directory whose path ends with "\<tail>".
-    std::wstring FindByTail(const std::wstring& tail) {
-        std::wstring needle = L"\\" + tail;
-        std::replace(needle.begin(), needle.end(), L'/', L'\\');
-        std::lock_guard lock(mutex_);
-        for (size_t i = 1; i <= count_; i++) {
-            const std::wstring& entry =
-                entries_[(next_ + kCapacity - i) % kCapacity];
-            if (entry.size() > needle.size() &&
-                text::EndsWithNoCase(entry, needle)) {
-                return entry;
-            }
-        }
-        return {};
-    }
-
-   private:
-    static constexpr size_t kCapacity = 64;
-    // Titles keep about 104 characters of a path; shorter paths show in full
-    // and are never looked up here.
-    static constexpr size_t kMinLength = 100;
-
-    static bool ToDirectory(LPCWSTR pathOrPattern, std::wstring& dir) {
-        dir.assign(pathOrPattern);
-        if (dir.find_first_of(L"*?") != std::wstring::npos) {
-            size_t slash = dir.find_last_of(L"\\/");
-            if (slash == std::wstring::npos) {
-                return false;
-            }
-            dir.resize(slash + 1);
-        }
-        std::replace(dir.begin(), dir.end(), L'/', L'\\');
-        if (dir.rfind(L"\\\\?\\UNC\\", 0) == 0) {
-            dir.erase(2, 6);  // "\\?\UNC\server" -> "\\server"
-        } else if (dir.rfind(L"\\\\?\\", 0) == 0) {
-            dir.erase(0, 4);
-        }
-        while (dir.size() > 3 && dir.back() == L'\\') {
-            dir.pop_back();  // keep "C:\" for drive roots
-        }
-        return text::IsAbsolutePath(dir);
-    }
-
-    std::mutex mutex_;
-    std::array<std::wstring, kCapacity> entries_;
-    size_t next_ = 0;
-    size_t count_ = 0;
-};
-
-DirectoryLog g_directoryLog;
-
-// ===========================================================================
 // Navigator
 //
 // Tracks the folder shown in the title and hands each new one to a worker
@@ -1705,9 +1615,6 @@ class Navigator {
     }
 
    private:
-    static constexpr int kResolveAttempts = 20;
-    static constexpr DWORD kResolveRetryMs = 50;
-
     static std::wstring PathFromTitle(const std::wstring& title) {
         size_t suffix = title.rfind(filepilot::kTitleSuffix);
         if (suffix == std::wstring::npos || suffix < 2 ||
@@ -1737,6 +1644,40 @@ class Navigator {
                (attributes & FILE_ATTRIBUTE_DIRECTORY);
     }
 
+    // A title path such as "Desktop\x" starts with a known folder's name:
+    // try "<that folder>\x" for each known folder of that name. File Pilot
+    // uses the first four; the others cover what it may add.
+    static std::wstring FindUnderKnownFolder(const std::wstring& tail) {
+        static const KNOWNFOLDERID* const kFolders[] = {
+            &FOLDERID_Desktop,  &FOLDERID_LocalAppData,
+            &FOLDERID_RoamingAppData, &FOLDERID_Profile,
+            &FOLDERID_Documents, &FOLDERID_Downloads,
+            &FOLDERID_Pictures, &FOLDERID_Music,
+            &FOLDERID_Videos,   &FOLDERID_LocalAppDataLow,
+        };
+
+        size_t slash = tail.find(L'\\');
+        size_t nameLength = slash == std::wstring::npos ? tail.size() : slash;
+        for (const KNOWNFOLDERID* folder : kFolders) {
+            PWSTR path = nullptr;
+            std::wstring candidate;
+            if (SUCCEEDED(SHGetKnownFolderPath(*folder, 0, nullptr, &path))) {
+                candidate = path;
+            }
+            CoTaskMemFree(path);
+            std::wstring name = text::LastComponent(candidate);
+            if (name.empty() || !text::EqualsNoCase(name.data(), name.size(),
+                                                   tail.data(), nameLength)) {
+                continue;
+            }
+            candidate += tail.substr(nameLength);
+            if (IsDirectory(candidate)) {
+                return candidate;
+            }
+        }
+        return {};
+    }
+
     // Navigation mostly stays in one tree, so try "<ancestor of the last
     // folder>\<tail>" from the deepest ancestor up.
     static std::wstring FindUnderFolder(const std::wstring& tail,
@@ -1764,25 +1705,19 @@ class Navigator {
         return generation == generation_;
     }
 
-    // Turns a title path into a full path, giving File Pilot a moment to
-    // open the folder when the title only shows its tail.
-    std::wstring Resolve(const std::wstring& titlePath, unsigned generation) {
+    // Turns a title path into a full path.
+    std::wstring Resolve(const std::wstring& titlePath) {
         if (text::IsAbsolutePath(titlePath)) {
             return titlePath;
         }
-        std::wstring lastFolder;
-        {
-            std::lock_guard lock(mutex_);
-            lastFolder = lastResolvedPath_;
-        }
-        std::wstring path = FindUnderFolder(titlePath, lastFolder);
-        for (int i = 0;
-             path.empty() && i < kResolveAttempts && IsCurrent(generation);
-             i++) {
-            path = g_directoryLog.FindByTail(titlePath);
-            if (path.empty()) {
-                Sleep(kResolveRetryMs);
+        std::wstring path = FindUnderKnownFolder(titlePath);
+        if (path.empty()) {
+            std::wstring lastFolder;
+            {
+                std::lock_guard lock(mutex_);
+                lastFolder = lastResolvedPath_;
             }
+            path = FindUnderFolder(titlePath, lastFolder);
         }
         if (path.empty()) {
             Wh_Log(L"Can't resolve %s", titlePath.c_str());
@@ -1793,7 +1728,7 @@ class Navigator {
     void Process(const std::wstring& titlePath,
                  const ViewRecords::Changes& changes,
                  unsigned generation) {
-        std::wstring path = Resolve(titlePath, generation);
+        std::wstring path = Resolve(titlePath);
         if (path.empty()) {
             return;
         }
@@ -1850,9 +1785,6 @@ using PeekMessageW_t = decltype(&PeekMessageW);
 using TranslateMessage_t = decltype(&TranslateMessage);
 using GetCursorPos_t = decltype(&GetCursorPos);
 using WindowFromPoint_t = decltype(&WindowFromPoint);
-using CreateFileW_t = decltype(&CreateFileW);
-using FindFirstFileW_t = decltype(&FindFirstFileW);
-using FindFirstFileExW_t = decltype(&FindFirstFileExW);
 
 SetWindowTextW_t SetWindowTextW_Original;
 GetKeyState_t GetKeyState_Original;
@@ -1860,9 +1792,6 @@ PeekMessageW_t PeekMessageW_Original;
 TranslateMessage_t TranslateMessage_Original;
 GetCursorPos_t GetCursorPos_Original;
 WindowFromPoint_t WindowFromPoint_Original;
-CreateFileW_t CreateFileW_Original;
-FindFirstFileW_t FindFirstFileW_Original;
-FindFirstFileExW_t FindFirstFileExW_Original;
 
 bool IsRealKeyDown(int vk) {
     return GetKeyState_Original(vk) & 0x8000;
@@ -1970,48 +1899,6 @@ BOOL WINAPI TranslateMessage_Hook(const MSG* msg) {
     return TranslateMessage_Original(msg);
 }
 
-// Folders are opened with backup semantics to be listed or watched.
-HANDLE WINAPI CreateFileW_Hook(LPCWSTR fileName,
-                               DWORD desiredAccess,
-                               DWORD shareMode,
-                               LPSECURITY_ATTRIBUTES securityAttributes,
-                               DWORD creationDisposition,
-                               DWORD flagsAndAttributes,
-                               HANDLE templateFile) {
-    HANDLE file = CreateFileW_Original(fileName, desiredAccess, shareMode,
-                                       securityAttributes, creationDisposition,
-                                       flagsAndAttributes, templateFile);
-    if (file != INVALID_HANDLE_VALUE &&
-        (flagsAndAttributes & FILE_FLAG_BACKUP_SEMANTICS)) {
-        g_directoryLog.Record(fileName);
-    }
-    return file;
-}
-
-HANDLE WINAPI FindFirstFileW_Hook(LPCWSTR fileName,
-                                  LPWIN32_FIND_DATAW findData) {
-    HANDLE find = FindFirstFileW_Original(fileName, findData);
-    if (find != INVALID_HANDLE_VALUE) {
-        g_directoryLog.Record(fileName);
-    }
-    return find;
-}
-
-HANDLE WINAPI FindFirstFileExW_Hook(LPCWSTR fileName,
-                                    FINDEX_INFO_LEVELS infoLevel,
-                                    LPVOID findData,
-                                    FINDEX_SEARCH_OPS searchOp,
-                                    LPVOID searchFilter,
-                                    DWORD additionalFlags) {
-    HANDLE find =
-        FindFirstFileExW_Original(fileName, infoLevel, findData, searchOp,
-                                  searchFilter, additionalFlags);
-    if (find != INVALID_HANDLE_VALUE) {
-        g_directoryLog.Record(fileName);
-    }
-    return find;
-}
-
 struct HookSpec {
     PCWSTR module;
     const char* function;
@@ -2034,14 +1921,6 @@ const HookSpec kHooks[] = {
     {L"user32.dll", "WindowFromPoint",
      reinterpret_cast<void*>(WindowFromPoint_Hook),
      reinterpret_cast<void**>(&WindowFromPoint_Original)},
-    {L"kernelbase.dll", "CreateFileW", reinterpret_cast<void*>(CreateFileW_Hook),
-     reinterpret_cast<void**>(&CreateFileW_Original)},
-    {L"kernelbase.dll", "FindFirstFileW",
-     reinterpret_cast<void*>(FindFirstFileW_Hook),
-     reinterpret_cast<void**>(&FindFirstFileW_Original)},
-    {L"kernelbase.dll", "FindFirstFileExW",
-     reinterpret_cast<void*>(FindFirstFileExW_Hook),
-     reinterpret_cast<void**>(&FindFirstFileExW_Original)},
 };
 
 bool InstallHooks() {
