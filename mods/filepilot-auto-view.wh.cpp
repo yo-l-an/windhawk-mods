@@ -19,7 +19,9 @@ Opens each folder in [File Pilot](https://filepilot.tech) with a view that
 suits what's inside, like Windows Explorer does for picture folders.
 
 ## How folders are matched
-Each folder you open is matched against templates, by file type:
+Each folder you open is matched against templates, by file type. These are
+the default templates: in Settings you can change them, add your own, or
+remove any.
 
 | Template | View |
 |---|---|
@@ -34,9 +36,8 @@ Each folder you open is matched against templates, by file type:
 - The mod reads the first 2000 items of a folder, which keeps large folders
   quick to open.
 
-All of this is adjustable in Settings: each template's file types, view, zoom
-and threshold, extra templates of your own, the number of items read, and
-folders to leave alone.
+Settings also cover each template's file types, view, zoom and threshold,
+the number of items read, and folders to leave alone.
 
 ### Your choices come first
 - A view you pick with a File Pilot View shortcut sticks to that folder, and
