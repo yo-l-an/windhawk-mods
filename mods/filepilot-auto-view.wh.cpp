@@ -701,6 +701,12 @@ void Wait() {
     }
 }
 
+// Whether tagged input is posted or being handled: the only time the frame
+// tracking in the PeekMessage hook has anything to do.
+bool IsPending() {
+    return g_phase != kIdle;
+}
+
 bool IsActive() {
     int phase = g_phase;
     if (phase != kDelivered && phase != kQueueDrained) {
@@ -922,7 +928,11 @@ class ViewRecords {
     }
 
    private:
-    static constexpr size_t kChunkSize = 4 << 20;
+    // View records live in small regions: 64 KB per tab, plus one of 512 KB.
+    // Larger regions (many of exactly 1 MB) hold images and caches: skipping
+    // them cuts a full scan from ~150 MB to ~17 MB, and avoids paging them
+    // back in.
+    static constexpr size_t kMaxRegionSize = 512 << 10;
 
     static bool IsRecord(const BYTE* data, size_t available) {
         using namespace filepilot;
@@ -976,37 +986,32 @@ class ViewRecords {
 
     static bool IsScannable(const MEMORY_BASIC_INFORMATION& info) {
         return info.State == MEM_COMMIT && info.Type == MEM_PRIVATE &&
-               info.Protect == PAGE_READWRITE;
+               info.Protect == PAGE_READWRITE &&
+               info.RegionSize <= kMaxRegionSize;
     }
 
-    void ScanRegion(const MEMORY_BASIC_INFORMATION& info,
-                    std::vector<uintptr_t>& records) {
-        uintptr_t regionStart = reinterpret_cast<uintptr_t>(info.BaseAddress);
-        uintptr_t regionEnd = regionStart + info.RegionSize;
-        for (uintptr_t start = regionStart; start < regionEnd;
-             start += kChunkSize) {
-            // Chunks overlap by one record, so none is cut in two.
-            size_t size = std::min<size_t>(chunk_.size(), regionEnd - start);
-            size_t read;
-            if (!ReadMemory(start, chunk_.data(), size, &read)) {
-                continue;
-            }
-            size_t scanEnd = std::min(read, kChunkSize);
-            for (size_t i = 0; i < scanEnd; i += alignof(float)) {
-                if (IsRecord(&chunk_[i], read - i)) {
-                    records.push_back(start + i);
-                }
+    static void ScanRegion(const MEMORY_BASIC_INFORMATION& info,
+                           std::vector<BYTE>& buffer,
+                           std::vector<uintptr_t>& records) {
+        uintptr_t start = reinterpret_cast<uintptr_t>(info.BaseAddress);
+        size_t read;
+        if (!ReadMemory(start, buffer.data(), info.RegionSize, &read)) {
+            return;
+        }
+        for (size_t i = 0; i + sizeof(filepilot::ViewRecordHeader) <= read;
+             i += alignof(float)) {
+            if (IsRecord(&buffer[i], read - i)) {
+                records.push_back(start + i);
             }
         }
     }
 
-    // Scans the regions with these base addresses, or all writable private
-    // memory when regions is null.
-    std::vector<uintptr_t> Scan(const std::vector<uintptr_t>* regions) {
+    // Scans the regions with these base addresses, or all small writable
+    // private regions when regions is null. The buffer only lives for the
+    // scan, so the mod holds no memory between scans.
+    static std::vector<uintptr_t> Scan(const std::vector<uintptr_t>* regions) {
         ULONGLONG startTime = GetTickCount64();
-        if (chunk_.empty()) {
-            chunk_.resize(kChunkSize + filepilot::kMaxRecordSize);
-        }
+        std::vector<BYTE> buffer(kMaxRegionSize);
         std::vector<uintptr_t> records;
         MEMORY_BASIC_INFORMATION info;
         if (regions) {
@@ -1014,7 +1019,7 @@ class ViewRecords {
                 if (VirtualQuery(reinterpret_cast<LPCVOID>(region), &info,
                                  sizeof(info)) &&
                     IsScannable(info)) {
-                    ScanRegion(info, records);
+                    ScanRegion(info, buffer, records);
                 }
             }
         } else {
@@ -1024,7 +1029,7 @@ class ViewRecords {
                  address = reinterpret_cast<uintptr_t>(info.BaseAddress) +
                            info.RegionSize) {
                 if (IsScannable(info)) {
-                    ScanRegion(info, records);
+                    ScanRegion(info, buffer, records);
                 }
             }
         }
@@ -1034,7 +1039,6 @@ class ViewRecords {
         return records;
     }
 
-    std::vector<BYTE> chunk_;
     std::vector<uintptr_t> regions_;
     std::vector<uintptr_t> seen_;  // records in the known regions last time
 };
@@ -1265,16 +1269,17 @@ void ApplyFolderLayout(const std::wstring& path,
 // Directory log
 //
 // Directories File Pilot opened lately, so a title that only shows a path's
-// tail can be resolved. File Pilot opens folders constantly while sizing
-// them, so recording reuses a fixed ring of strings and doesn't allocate once
-// warmed up.
+// tail can be resolved. File Pilot opens tens of thousands of folders while
+// sizing them, so recording rejects most of them with a bounded length check
+// before any copy or lock, and reuses a fixed ring of strings.
 
 class DirectoryLog {
    public:
     // Records "C:\dir" from a directory path or a listing pattern such as
     // "\\?\C:\dir\*".
     void Record(LPCWSTR pathOrPattern) {
-        if (!pathOrPattern || t_ownScan) {
+        if (!pathOrPattern || t_ownScan ||
+            wcsnlen(pathOrPattern, kMinLength) < kMinLength) {
             return;
         }
         thread_local std::wstring dir;
@@ -1309,7 +1314,10 @@ class DirectoryLog {
     }
 
    private:
-    static constexpr size_t kCapacity = 256;
+    static constexpr size_t kCapacity = 64;
+    // Titles keep about 104 characters of a path; shorter paths show in full
+    // and are never looked up here.
+    static constexpr size_t kMinLength = 100;
 
     static bool ToDirectory(LPCWSTR pathOrPattern, std::wstring& dir) {
         dir.assign(pathOrPattern);
@@ -1626,7 +1634,7 @@ BOOL WINAPI PeekMessageW_Hook(LPMSG msg,
                               UINT filterMin,
                               UINT filterMax,
                               UINT removeMsg) {
-    bool isUiThread = main_window::IsUiThread();
+    bool isUiThread = fake_input::IsPending() && main_window::IsUiThread();
     if (isUiThread) {
         fake_input::OnFrameDone();
     }
