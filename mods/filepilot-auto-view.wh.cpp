@@ -8,7 +8,6 @@
 // @license         MIT
 // @include         FPilot.exe
 // ==/WindhawkMod==
-
 // ==WindhawkModReadme==
 /*
 # File Pilot Auto View
@@ -46,9 +45,11 @@ folders to leave alone.
   template applies again on your next visit.
 
 ## Limitations
-- Switching tabs, opening a new tab or window, and the first folder after
-  File Pilot starts briefly flash File Pilot's view menu in the bottom-right
-  corner. Moving between folders within a tab switches without it.
+- File Pilot's view menu can flash in the bottom-right corner after
+  switching tabs, opening a new tab or window, starting File Pilot, or coming
+  from a folder in File Pilot's default view.
+- A new tab on the same folder (Ctrl+T) shows File Pilot's default view until
+  you open another folder.
 - When the mod can't set the zoom directly, it zooms the way Ctrl+scroll does,
   in 5.5% steps, so 45% becomes 44%.
 
@@ -186,6 +187,10 @@ constexpr wchar_t kWindowClass[] = L"File Pilot";
 constexpr wchar_t kTitleSuffix[] = L" - File Pilot";
 constexpr wchar_t kConfigFile[] =
     L"%APPDATA%\\Voidstar\\FilePilot\\FPilot-Config.json";
+// Holds "DefaultFolder", the view each navigation and new tab starts from
+// unless the folder has a view saved in File Pilot.
+constexpr wchar_t kUserDataFile[] =
+    L"%APPDATA%\\Voidstar\\FilePilot\\FPilot-UserData.json";
 
 // "HK_View<command>" hotkey commands in the config file, indexed by View.
 // Unbound ones default to Ctrl+Shift+1..6 in the same order.
@@ -201,8 +206,12 @@ constexpr float kViewZoom[kViewCount] = {0.0f, 0.1f, 0.2f, 0.3f, 0.65f, 1.0f};
 constexpr double kZoomPerWheelMessage = 5.5;
 
 // Each folder view lives in a heap record: this header, then columnCount
-// ViewColumns whose ratios add up to 1. A new record is made on each
-// navigation, in a memory region of its tab; switching tabs makes none.
+// ViewColumns whose ratios add up to 1. Each tab keeps its record in a memory
+// region of its own, mostly at one address, and resets it on each navigation
+// to the folder's saved view or the default one, just before the title
+// changes; switching tabs touches none. The kRecordStampSize bytes before a
+// record change with each reset and view switch, but not with zooms within a
+// view.
 struct ViewRecordHeader {
     float zoom;
     int32_t sortedBy;
@@ -220,6 +229,11 @@ constexpr int kMaxColumnKind = 63;
 constexpr int kMaxSortedBy = 63;
 constexpr size_t kMaxRecordSize =
     sizeof(ViewRecordHeader) + kMaxRecordColumns * sizeof(ViewColumn);
+constexpr size_t kRecordStampSize = 8;
+
+// Zooms are compared with this tolerance, so values that went through File
+// Pilot's settings file still match.
+constexpr float kZoomTolerance = 0.001f;
 
 }  // namespace filepilot
 
@@ -448,16 +462,17 @@ Hotkey ParseHotkey(const std::string& keys) {
     return hotkey;
 }
 
-std::string ReadFilePilotConfig() {
+// Reads one of File Pilot's files, never writing it.
+std::string ReadFilePilotFile(PCWSTR unexpandedPath) {
     wchar_t path[MAX_PATH];
-    if (!ExpandEnvironmentStringsW(filepilot::kConfigFile, path, MAX_PATH)) {
+    if (!ExpandEnvironmentStringsW(unexpandedPath, path, MAX_PATH)) {
         return {};
     }
     HANDLE file = CreateFileW(path, GENERIC_READ,
                               FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                               OPEN_EXISTING, 0, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
-        Wh_Log(L"Can't open %s, using default hotkeys", path);
+        Wh_Log(L"Can't open %s", path);
         return {};
     }
     std::string contents(GetFileSize(file, nullptr), '\0');
@@ -474,7 +489,7 @@ void LoadHotkeys(std::array<Hotkey, kViewCount>& hotkeys) {
         hotkeys[i] = {static_cast<UINT>('1' + i), true, true, false};
     }
 
-    std::string contents = ReadFilePilotConfig();
+    std::string contents = ReadFilePilotFile(filepilot::kConfigFile);
     std::regex binding(
         R"re("Keys"\s*:\s*\[\s*"([^"]+)"[^\]]*\]\s*,\s*"Command"\s*:\s*"HK_View(\w+)")re");
     for (std::sregex_iterator it(contents.begin(), contents.end(), binding),
@@ -520,6 +535,54 @@ void Reload() {
 }
 
 }  // namespace config
+
+// ===========================================================================
+// Default view
+
+// The zoom of File Pilot's default folder view. Read from its user data file,
+// again only when the file changes. Used by the worker thread only.
+class DefaultView {
+   public:
+    bool ReadZoom(float* zoom) {
+        wchar_t path[MAX_PATH];
+        WIN32_FILE_ATTRIBUTE_DATA info;
+        if (!ExpandEnvironmentStringsW(filepilot::kUserDataFile, path,
+                                       MAX_PATH) ||
+            !GetFileAttributesExW(path, GetFileExInfoStandard, &info)) {
+            return false;
+        }
+        if (CompareFileTime(&info.ftLastWriteTime, &readTime_) != 0) {
+            readTime_ = info.ftLastWriteTime;
+            hasZoom_ =
+                Parse(config::ReadFilePilotFile(filepilot::kUserDataFile),
+                      &zoom_);
+        }
+        *zoom = zoom_;
+        return hasZoom_;
+    }
+
+   private:
+    // Finds "DefaultFolder": {"ZoomLevel": 0.100000, ...}.
+    static bool Parse(const std::string& contents, float* zoom) {
+        size_t folder = contents.find("\"DefaultFolder\"");
+        size_t level = contents.find("\"ZoomLevel\"", folder);
+        size_t colon = contents.find(':', level);
+        if (folder == std::string::npos || level == std::string::npos ||
+            colon == std::string::npos) {
+            return false;
+        }
+        const char* start = contents.c_str() + colon + 1;
+        char* end;
+        *zoom = std::strtof(start, &end);
+        return end != start && *zoom >= 0.0f && *zoom <= 1.0f;
+    }
+
+    FILETIME readTime_ = {};
+    float zoom_ = 0.0f;
+    bool hasZoom_ = false;
+};
+
+DefaultView g_defaultView;
 
 // ===========================================================================
 // Manual views
@@ -809,6 +872,22 @@ LPARAM KeyLParam(const Hotkey& hotkey, bool up) {
     return lParam;
 }
 
+// Waits until the user lets go of modifier keys, such as the Alt of Alt+Left:
+// File Pilot reads them with ours, and ignores a hotkey with an extra one.
+void WaitForModifiersUp() {
+    constexpr int kModifiers[] = {VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN,
+                                  VK_RWIN};
+    constexpr ULONGLONG kMaxWaitMs = 2000;
+    constexpr DWORD kPollMs = 10;
+
+    ULONGLONG start = GetTickCount64();
+    while (GetTickCount64() - start < kMaxWaitMs &&
+           std::any_of(std::begin(kModifiers), std::end(kModifiers),
+                       [](int vk) { return GetAsyncKeyState(vk) & 0x8000; })) {
+        Sleep(kPollMs);
+    }
+}
+
 void PostAndWait(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     fake_input::Begin();
     PostMessageW(hwnd, message, wParam, lParam);
@@ -818,6 +897,7 @@ void PostAndWait(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
 void PressHotkey(HWND hwnd, const Hotkey& hotkey) {
     UINT down = hotkey.alt ? WM_SYSKEYDOWN : WM_KEYDOWN;
     UINT up = hotkey.alt ? WM_SYSKEYUP : WM_KEYUP;
+    WaitForModifiersUp();
     PostAndWait(hwnd, down, hotkey.vk, KeyLParam(hotkey, false));
     PostAndWait(hwnd, up, hotkey.vk, KeyLParam(hotkey, true));
 }
@@ -835,6 +915,7 @@ void WheelZoom(HWND hwnd, int notches) {
     ScreenToClient(hwnd, &clientPoint);
     SHORT delta = notches > 0 ? WHEEL_DELTA : -WHEEL_DELTA;
 
+    WaitForModifiersUp();
     fake_input::Begin();
     PostMessageW(hwnd, WM_MOUSEMOVE, fake_input::kMouseTag,
                  MAKELPARAM(clientPoint.x, clientPoint.y));
@@ -853,42 +934,70 @@ void WheelZoom(HWND hwnd, int notches) {
 // View records
 //
 // Finds File Pilot's view records by their shape (filepilot::ViewRecordHeader)
-// in writable private memory. Memory may be freed while it's read, so all
-// access goes through Read/WriteProcessMemory, which fail instead of
-// crashing. Used by the worker thread only.
+// in writable private memory, and tells which one a navigation reset. Memory
+// may be freed while it's read, so all access goes through
+// Read/WriteProcessMemory, which fail instead of crashing.
 
 class ViewRecords {
    public:
-    std::vector<uintptr_t> FindInKnownRegions() { return Scan(&regions_); }
+    // Records that changed in the known regions since the last title change.
+    struct Changes {
+        // The one record a navigation made or reset: the current folder's.
+        uintptr_t current = 0;
+        // Otherwise, the one record changed some other way. Usually the
+        // current folder's, but a view change in the tab just left changes
+        // that tab's record too, so it's only trusted for reading.
+        uintptr_t changed = 0;
+    };
 
-    std::vector<uintptr_t> FindEverywhere() { return Scan(nullptr); }
-
-    // Called for every folder change, whatever the mod does with the folder.
-    // A navigation makes exactly one new record in the known regions, so that
-    // record is the current folder's. Returns it, or 0 when there isn't
-    // exactly one: a tab switch, a tab in an unknown region, or changes the
-    // mod missed. Never guess past that: a wrong record changes another
-    // folder's view, which File Pilot then saves.
-    uintptr_t TakeFreshRecord() {
-        std::vector<uintptr_t> records = FindInKnownRegions();
-        uintptr_t fresh = 0;
-        int freshCount = 0;
-        for (uintptr_t record : records) {
-            if (std::find(seen_.begin(), seen_.end(), record) == seen_.end()) {
-                fresh = record;
-                freshCount++;
+    // Called on every title change, by the UI thread that has just reset the
+    // record, so each change is told apart from the next, however busy the
+    // worker is. Scans only the known regions: well under a millisecond.
+    // Never guess past Changes: a wrong record changes another folder's view.
+    Changes TakeChanges() {
+        std::lock_guard lock(mutex_);
+        bool manualZoom = manualZoom_.exchange(false);
+        std::vector<Seen> records = Snapshot(Scan(&regions_));
+        uintptr_t current = 0, changed = 0;
+        int currentCount = 0, changedCount = 0;
+        for (const Seen& record : records) {
+            auto seen = std::find_if(
+                seen_.begin(), seen_.end(),
+                [&](const Seen& s) { return s.address == record.address; });
+            if (seen == seen_.end()) {
+                current = record.address;
+                currentCount++;
+                continue;
+            }
+            bool stampChanged = seen->stamp != record.stamp;
+            if (!stampChanged && seen->zoom == record.zoom) {
+                continue;
+            }
+            // A zoom changed within a view keeps the stamp: only the user's
+            // own zooms can do that besides a navigation.
+            if (IsReset(record.stamp) && (stampChanged || !manualZoom)) {
+                current = record.address;
+                currentCount++;
+            } else {
+                changed = record.address;
+                changedCount++;
             }
         }
         seen_ = std::move(records);
-        return freshCount == 1 ? fresh : 0;
+        if (currentCount) {
+            return {currentCount == 1 ? current : 0, 0};
+        }
+        return {0, changedCount == 1 ? changed : 0};
     }
 
-    // Marks the records now in the known regions as seen, after the current
-    // record was found another way.
-    void MarkKnownRegionsSeen() { seen_ = FindInKnownRegions(); }
+    // The user zoomed (Ctrl+wheel or a View hotkey) since the last title
+    // change. Called from the UI thread.
+    void NoteManualZoom() { manualZoom_ = true; }
 
-    // Remembers the region holding a record: File Pilot keeps allocating new
-    // records in the same few regions.
+    std::vector<uintptr_t> FindEverywhere() { return Scan(nullptr); }
+
+    // Remembers the region holding a record, File Pilot's for that tab, and
+    // takes its records as seen.
     void RememberRegionOf(uintptr_t record) {
         MEMORY_BASIC_INFORMATION info;
         if (!VirtualQuery(reinterpret_cast<LPCVOID>(record), &info,
@@ -896,10 +1005,12 @@ class ViewRecords {
             return;
         }
         uintptr_t region = reinterpret_cast<uintptr_t>(info.BaseAddress);
+        std::lock_guard lock(mutex_);
         if (std::find(regions_.begin(), regions_.end(), region) ==
             regions_.end()) {
             regions_.push_back(region);
         }
+        seen_ = Snapshot(Scan(&regions_));
     }
 
     static bool ReadZoom(uintptr_t record, float* zoom) {
@@ -913,18 +1024,34 @@ class ViewRecords {
         return true;
     }
 
+    static bool HasZoom(uintptr_t record, float zoom) {
+        float current;
+        return ReadZoom(record, &current) &&
+               std::fabs(current - zoom) < filepilot::kZoomTolerance;
+    }
+
     // Writes only if the address still holds a view record, checked right
-    // before writing, and only a zoom File Pilot itself can hold.
-    static bool WriteZoom(uintptr_t record, float zoom) {
+    // before writing, and only a zoom File Pilot itself can hold. The new
+    // zoom is taken as seen, so it doesn't pass for a navigation.
+    bool WriteZoom(uintptr_t record, float zoom) {
         float current;
         if (!(zoom >= 0.0f && zoom <= 1.0f) || !ReadZoom(record, &current)) {
             return false;
         }
+        std::lock_guard lock(mutex_);
         SIZE_T written = 0;
-        return WriteProcessMemory(GetCurrentProcess(),
-                                  reinterpret_cast<LPVOID>(record), &zoom,
-                                  sizeof(zoom), &written) &&
-               written == sizeof(zoom);
+        if (!WriteProcessMemory(GetCurrentProcess(),
+                                reinterpret_cast<LPVOID>(record), &zoom,
+                                sizeof(zoom), &written) ||
+            written != sizeof(zoom)) {
+            return false;
+        }
+        for (Seen& seen : seen_) {
+            if (seen.address == record) {
+                seen.zoom = zoom;
+            }
+        }
+        return true;
     }
 
    private:
@@ -933,6 +1060,32 @@ class ViewRecords {
     // them cuts a full scan from ~150 MB to ~17 MB, and avoids paging them
     // back in.
     static constexpr size_t kMaxRegionSize = 512 << 10;
+
+    struct Seen {
+        uintptr_t address;
+        uint64_t stamp;  // the kRecordStampSize bytes before the record
+        float zoom;
+    };
+
+    // A navigation resets a record with the upper half of its stamp at 0;
+    // view changes count up there.
+    static bool IsReset(uint64_t stamp) { return (stamp >> 32) == 0; }
+
+    static std::vector<Seen> Snapshot(const std::vector<uintptr_t>& records) {
+        static_assert(sizeof(uint64_t) == filepilot::kRecordStampSize);
+        std::vector<Seen> seen;
+        seen.reserve(records.size());
+        for (uintptr_t record : records) {
+            Seen entry{record, 0, 0.0f};
+            size_t read;
+            if (ReadMemory(record - sizeof(entry.stamp), &entry.stamp,
+                           sizeof(entry.stamp), &read) &&
+                read == sizeof(entry.stamp) && ReadZoom(record, &entry.zoom)) {
+                seen.push_back(entry);
+            }
+        }
+        return seen;
+    }
 
     static bool IsRecord(const BYTE* data, size_t available) {
         using namespace filepilot;
@@ -994,6 +1147,9 @@ class ViewRecords {
                            std::vector<BYTE>& buffer,
                            std::vector<uintptr_t>& records) {
         uintptr_t start = reinterpret_cast<uintptr_t>(info.BaseAddress);
+        if (buffer.size() < info.RegionSize) {
+            buffer.resize(info.RegionSize);
+        }
         size_t read;
         if (!ReadMemory(start, buffer.data(), info.RegionSize, &read)) {
             return;
@@ -1008,10 +1164,11 @@ class ViewRecords {
 
     // Scans the regions with these base addresses, or all small writable
     // private regions when regions is null. The buffer only lives for the
-    // scan, so the mod holds no memory between scans.
+    // scan and grows to the largest region read, so the mod holds no memory
+    // between scans.
     static std::vector<uintptr_t> Scan(const std::vector<uintptr_t>* regions) {
         ULONGLONG startTime = GetTickCount64();
-        std::vector<BYTE> buffer(kMaxRegionSize);
+        std::vector<BYTE> buffer;
         std::vector<uintptr_t> records;
         MEMORY_BASIC_INFORMATION info;
         if (regions) {
@@ -1039,8 +1196,10 @@ class ViewRecords {
         return records;
     }
 
+    std::mutex mutex_;  // guards regions_ and seen_
     std::vector<uintptr_t> regions_;
-    std::vector<uintptr_t> seen_;  // records in the known regions last time
+    std::vector<Seen> seen_;  // records in the known regions last time
+    std::atomic<bool> manualZoom_ = false;
 };
 
 ViewRecords g_viewRecords;
@@ -1132,74 +1291,134 @@ std::array<View, kViewCount> PresetsByDistance(float zoom) {
     return presets;
 }
 
-// Finds the current folder's record by pressing a view preset and seeing
-// which record, in all memory, takes its zoom. File Pilot shows its view
-// popover for a moment, so this is only for when TakeFreshRecord can't tell.
-// A folder already at the nearest preset doesn't react to it, so the next
-// one is tried. Returns 0 unless exactly one record reacts.
-uintptr_t FindRecordWithPreset(HWND hwnd, const Config& config, float zoom) {
-    constexpr int kPresetsTried = 2;
+using RecordZooms = std::vector<std::pair<uintptr_t, float>>;
 
-    std::vector<std::pair<uintptr_t, float>> records;
+// Every view record in memory, with its zoom.
+RecordZooms ZoomsEverywhere() {
+    RecordZooms zooms;
     for (uintptr_t record : g_viewRecords.FindEverywhere()) {
-        float recordZoom;
-        if (ViewRecords::ReadZoom(record, &recordZoom)) {
-            records.push_back({record, recordZoom});
+        float zoom;
+        if (ViewRecords::ReadZoom(record, &zoom)) {
+            zooms.push_back({record, zoom});
         }
     }
+    return zooms;
+}
 
+// The records in now that took this zoom since before: by changing to it, or
+// by appearing with it, as a view switch can move a record.
+std::vector<uintptr_t> TookZoom(const RecordZooms& before,
+                                const RecordZooms& now,
+                                float zoom) {
+    std::vector<uintptr_t> records;
+    for (const auto& [record, newZoom] : now) {
+        auto old = std::find_if(
+            before.begin(), before.end(),
+            [&](const auto& r) { return r.first == record; });
+        if (newZoom == zoom && (old == before.end() || old->second != zoom)) {
+            records.push_back(record);
+        }
+    }
+    return records;
+}
+
+// Waits for a preset press to reach the view records. File Pilot applies it
+// a frame or two later, so the known records are read again until one takes
+// the zoom; then all memory is scanned once more for records that moved.
+std::vector<uintptr_t> WaitForPreset(const RecordZooms& before, float zoom) {
+    constexpr ULONGLONG kWaitMs = 250;
+    constexpr DWORD kPollMs = 10;
+
+    ULONGLONG start = GetTickCount64();
+    RecordZooms known = before;
+    while (GetTickCount64() - start < kWaitMs) {
+        for (auto& [record, recordZoom] : known) {
+            ViewRecords::ReadZoom(record, &recordZoom);
+        }
+        if (!TookZoom(before, known, zoom).empty()) {
+            break;
+        }
+        Sleep(kPollMs);
+    }
+    return TookZoom(before, ZoomsEverywhere(), zoom);
+}
+
+// Finds the current folder's record by pressing a view preset and seeing
+// which record, in all memory, takes its zoom. File Pilot shows its view
+// popover for a moment, so this is only for when TakeChanges finds no current
+// record.
+// A folder already at the nearest preset doesn't react to it: when that
+// preset is the zoom wanted, there's nothing left to do and *alreadyThere is
+// set, else the next preset is tried. Returns 0 unless exactly one record
+// reacts.
+uintptr_t FindRecordWithPreset(HWND hwnd,
+                               const Config& config,
+                               float zoom,
+                               bool* alreadyThere) {
+    *alreadyThere = false;
+    constexpr int kPresetsTried = 2;
+
+    RecordZooms before = ZoomsEverywhere();
     std::array<View, kViewCount> presets = PresetsByDistance(zoom);
     for (int i = 0; i < kPresetsTried; i++) {
         float presetZoom = filepilot::kViewZoom[static_cast<int>(presets[i])];
         synth::PressHotkey(hwnd, config.hotkeys[static_cast<int>(presets[i])]);
 
-        uintptr_t reacted = 0;
-        int reactedCount = 0;
-        for (auto& [record, oldZoom] : records) {
-            float newZoom;
-            if (!ViewRecords::ReadZoom(record, &newZoom)) {
-                continue;
-            }
-            if (newZoom != oldZoom && newZoom == presetZoom) {
-                reacted = record;
-                reactedCount++;
-            }
-            oldZoom = newZoom;  // the baseline for the next preset
+        std::vector<uintptr_t> reacted = WaitForPreset(before, presetZoom);
+        if (reacted.size() == 1) {
+            return reacted[0];
         }
-        if (reactedCount == 1) {
-            return reacted;
-        }
-        if (reactedCount > 1) {
+        if (reacted.size() > 1) {
+            Wh_Log(L"%zu view records took the preset", reacted.size());
             break;
         }
+        if (std::fabs(presetZoom - zoom) < filepilot::kZoomTolerance) {
+            *alreadyThere = true;
+            return 0;
+        }
+        before = ZoomsEverywhere();  // the baseline for the next preset
     }
     Wh_Log(L"Can't tell the view record apart");
     return 0;
 }
 
 // Applies a layout by writing its zoom into the folder's view record, which
-// shows no popover. freshRecord comes from TakeFreshRecord for this folder
-// change; without it (tab switches, new tabs and windows) the record is found
-// with a preset.
+// shows no popover, and only when the zoom differs. changes come from
+// TakeChanges for this folder change. Without a current record (tab switches,
+// new tabs and windows, and navigations that leave the record as it was) the
+// record is found with a preset, unless the changed one already has the zoom.
 bool ApplyThroughRecord(HWND hwnd,
                         const Config& config,
                         const std::wstring& folder,
                         const Layout& layout,
-                        uintptr_t freshRecord) {
+                        const ViewRecords::Changes& changes) {
     float zoom = layout.RecordZoom();
-    uintptr_t record = freshRecord;
-    if (!record) {
-        Wh_Log(L"%s: no new view record, finding it with a preset",
-               folder.c_str());
-        record = FindRecordWithPreset(hwnd, config, zoom);
-        if (!record) {
-            return false;
-        }
-        g_viewRecords.RememberRegionOf(record);
-        g_viewRecords.MarkKnownRegionsSeen();
+    uintptr_t record = changes.current;
+    bool alreadyThere =
+        record ? ViewRecords::HasZoom(record, zoom)
+               : changes.changed && ViewRecords::HasZoom(changes.changed, zoom);
+    // Navigations and new tabs start from the default view, so a folder
+    // with no record to read is already there.
+    float defaultZoom;
+    if (!record && !alreadyThere && g_defaultView.ReadZoom(&defaultZoom) &&
+        std::fabs(defaultZoom - zoom) < filepilot::kZoomTolerance) {
+        Wh_Log(L"%s: zoom %g is File Pilot's default", folder.c_str(), zoom);
+        return true;
     }
-
-    if (!ViewRecords::WriteZoom(record, zoom)) {
+    if (!record && !alreadyThere) {
+        Wh_Log(L"%s: no current view record, finding it with a preset",
+               folder.c_str());
+        record = FindRecordWithPreset(hwnd, config, zoom, &alreadyThere);
+        if (record) {
+            g_viewRecords.RememberRegionOf(record);
+            alreadyThere = ViewRecords::HasZoom(record, zoom);
+        }
+    }
+    if (alreadyThere) {
+        Wh_Log(L"%s: already at zoom %g", folder.c_str(), zoom);
+        return true;
+    }
+    if (!record || !g_viewRecords.WriteZoom(record, zoom)) {
         return false;
     }
     // Make File Pilot render the new zoom on its next frame.
@@ -1220,8 +1439,8 @@ void ApplyLayout(HWND hwnd,
                  const Config& config,
                  const std::wstring& folder,
                  const Layout& layout,
-                 uintptr_t freshRecord) {
-    if (ApplyThroughRecord(hwnd, config, folder, layout, freshRecord)) {
+                 const ViewRecords::Changes& recordChanges) {
+    if (ApplyThroughRecord(hwnd, config, folder, layout, recordChanges)) {
         return;
     }
     if (layout.HasCustomZoom()) {
@@ -1232,12 +1451,11 @@ void ApplyLayout(HWND hwnd,
     synth::PressHotkey(hwnd, config.hotkeys[static_cast<int>(layout.view)]);
 }
 
-// Picks and applies the layout for a folder. stillCurrent tells whether the
-// user is still in it.
+// Picks and applies the layout for a folder. recordChanges were taken when
+// its title appeared; stillCurrent tells whether the user is still in it.
 void ApplyFolderLayout(const std::wstring& path,
+                       const ViewRecords::Changes& recordChanges,
                        const std::function<bool()>& stillCurrent) {
-    // Taken on every folder change, so the next one's new record stands out.
-    uintptr_t freshRecord = g_viewRecords.TakeFreshRecord();
     std::shared_ptr<const Config> config = config::Current();
     std::wstring normalized = text::NormalizePath(path);
     if (config->IsExcluded(normalized)) {
@@ -1262,7 +1480,7 @@ void ApplyFolderLayout(const std::wstring& path,
     }
     Wh_Log(L"%s: switching to %s, zoom %d", path.c_str(),
            ViewName(layout.view), layout.zoom);
-    ApplyLayout(hwnd, *config, normalized, layout, freshRecord);
+    ApplyLayout(hwnd, *config, normalized, layout, recordChanges);
 }
 
 // ===========================================================================
@@ -1386,6 +1604,8 @@ class Navigator {
             return;
         }
         titlePath_ = path;
+        // Taken on every folder change, so the next one's changes stand out.
+        ViewRecords::Changes changes = g_viewRecords.TakeChanges();
         resolvedPath_ = text::IsAbsolutePath(path) ? path : L"";
         if (!resolvedPath_.empty()) {
             lastResolvedPath_ = resolvedPath_;
@@ -1393,6 +1613,7 @@ class Navigator {
         generation_++;
         if (apply && !path.empty()) {
             pendingPath_ = path;
+            pendingChanges_ = changes;
             hasPending_ = true;
             wake_.notify_one();
         }
@@ -1495,7 +1716,9 @@ class Navigator {
         return path;
     }
 
-    void Process(const std::wstring& titlePath, unsigned generation) {
+    void Process(const std::wstring& titlePath,
+                 const ViewRecords::Changes& changes,
+                 unsigned generation) {
         std::wstring path = Resolve(titlePath, generation);
         if (path.empty()) {
             return;
@@ -1508,7 +1731,8 @@ class Navigator {
             resolvedPath_ = path;
             lastResolvedPath_ = path;
         }
-        ApplyFolderLayout(path, [&] { return IsCurrent(generation); });
+        ApplyFolderLayout(path, changes,
+                          [&] { return IsCurrent(generation); });
     }
 
     void Run() {
@@ -1519,10 +1743,11 @@ class Navigator {
                 return;
             }
             std::wstring path = pendingPath_;
+            ViewRecords::Changes changes = pendingChanges_;
             unsigned generation = generation_;
             hasPending_ = false;
             lock.unlock();
-            Process(path, generation);
+            Process(path, changes, generation);
             lock.lock();
         }
     }
@@ -1535,6 +1760,7 @@ class Navigator {
     std::wstring resolvedPath_;      // the current folder's full path
     std::wstring lastResolvedPath_;  // kept across folder changes
     std::wstring pendingPath_;
+    ViewRecords::Changes pendingChanges_;
     bool hasPending_ = false;
     unsigned generation_ = 0;
 };
@@ -1568,33 +1794,44 @@ bool IsRealKeyDown(int vk) {
     return GetKeyState_Original(vk) & 0x8000;
 }
 
-// A real View hotkey press: remember the user's choice for this folder.
-void RememberManualView(const MSG& msg) {
+// The View hotkey a real key press matches, or View::None.
+View ViewOfHotkey(const MSG& msg, const Config& config) {
     bool isFirstKeyDown =
         (msg.message == WM_KEYDOWN || msg.message == WM_SYSKEYDOWN) &&
         !(msg.lParam & 0x40000000);
     if (!isFirstKeyDown) {
+        return View::None;
+    }
+    for (int i = 0; i < kViewCount; i++) {
+        const Hotkey& hotkey = config.hotkeys[i];
+        if (hotkey.vk == msg.wParam &&
+            hotkey.ctrl == IsRealKeyDown(VK_CONTROL) &&
+            hotkey.shift == IsRealKeyDown(VK_SHIFT) &&
+            hotkey.alt == IsRealKeyDown(VK_MENU)) {
+            return static_cast<View>(i);
+        }
+    }
+    return View::None;
+}
+
+// The user's own zooms: noted so they don't pass for a navigation, and View
+// hotkeys are remembered for the folder.
+void OnUserInput(const MSG& msg) {
+    if (msg.message == WM_MOUSEWHEEL &&
+        (GET_KEYSTATE_WPARAM(msg.wParam) & MK_CONTROL)) {
+        g_viewRecords.NoteManualZoom();
         return;
     }
     std::shared_ptr<const Config> config = config::Current();
-    if (!config->rememberManual) {
+    View view = ViewOfHotkey(msg, *config);
+    if (view == View::None) {
         return;
     }
-    for (int i = 0; i < kViewCount; i++) {
-        const Hotkey& hotkey = config->hotkeys[i];
-        if (hotkey.vk != msg.wParam ||
-            hotkey.ctrl != IsRealKeyDown(VK_CONTROL) ||
-            hotkey.shift != IsRealKeyDown(VK_SHIFT) ||
-            hotkey.alt != IsRealKeyDown(VK_MENU)) {
-            continue;
-        }
-        std::wstring folder = g_navigator.CurrentFolder();
-        if (!folder.empty()) {
-            View view = static_cast<View>(i);
-            Wh_Log(L"Remembering %s for %s", ViewName(view), folder.c_str());
-            g_manualViews.Remember(text::NormalizePath(folder), view);
-        }
-        return;
+    g_viewRecords.NoteManualZoom();
+    std::wstring folder = g_navigator.CurrentFolder();
+    if (config->rememberManual && !folder.empty()) {
+        Wh_Log(L"Remembering %s for %s", ViewName(view), folder.c_str());
+        g_manualViews.Remember(text::NormalizePath(folder), view);
     }
 }
 
@@ -1643,7 +1880,7 @@ BOOL WINAPI PeekMessageW_Hook(LPMSG msg,
     if (result && (removeMsg & PM_REMOVE) && msg->hwnd &&
         msg->hwnd == main_window::Handle()) {
         if (!fake_input::OnMessage(*msg)) {
-            RememberManualView(*msg);
+            OnUserInput(*msg);
         }
     } else if (!result && isUiThread) {
         fake_input::OnQueueDrained();
