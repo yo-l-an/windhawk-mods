@@ -76,7 +76,7 @@ File Pilot back to normal, and check for a mod update.
     - extensions: jpg jpeg jfif png gif webp bmp tif tiff heic heif avif svg ico psd raw dng cr2 cr3 nef arw orf rw2
       $name: Extensions
       $description: Separated by spaces or commas, without dots
-    - view: medium
+    - view: custom
       $name: View
       $options:
       - details: Details
@@ -85,24 +85,24 @@ File Pilot back to normal, and check for a mod update.
       - medium: Medium icons
       - large: Large icons
       - xl: Extra large icons
+      - custom: Custom zoom
     - zoom: 45
-      $name: Icon zoom (%)
+      $name: Custom zoom (%)
       $description: >-
-        For icon views: 30 (Medium) to 100 (Extra large). 0 keeps the view's
-        own size. If File Pilot's view can't be found in memory, the zoom is
-        rounded to Ctrl+wheel steps of 5.5% from 0.
+        Used when View is Custom zoom, from 0 to 100. Below 30, File Pilot only
+        has Details (0), Tree (10) and List (20), and rounds up to the next one
     - threshold: 60
       $name: Match threshold (%)
       $description: Share of the folder's files these extensions must reach
   - - name: Videos
     - extensions: mp4 mkv mov avi webm wmv m4v flv mpg mpeg ts mts m2ts 3gp
-    - view: medium
+    - view: custom
     - zoom: 45
     - threshold: 60
   - - name: Documents
     - extensions: pdf doc docx xls xlsx ppt pptx odt ods odp rtf txt md csv epub
     - view: tree
-    - zoom: 0
+    - zoom: 45
     - threshold: 60
   $name: Templates
   $description: >-
@@ -376,6 +376,18 @@ struct Config {
 namespace config {
 
 constexpr int kDefaultThreshold = 60;
+constexpr wchar_t kCustomZoomView[] = L"custom";
+
+// The layout a zoom (percent) shows. Below icons, File Pilot only has
+// Details (0), Tree (10) and List (20), and takes other zooms up to the next
+// one, so they become that view: the zoom then reads back as written.
+Layout CustomZoomLayout(int zoom) {
+    constexpr int kMediumIconsZoom = 30;
+    if (zoom >= kMediumIconsZoom) {
+        return {View::Medium, zoom};
+    }
+    return {static_cast<View>((zoom + 9) / 10)};
+}
 
 std::mutex g_mutex;
 std::shared_ptr<const Config> g_current = std::make_shared<Config>();
@@ -397,9 +409,13 @@ void LoadRules(Config& config) {
             break;
         }
 
+        // "custom" is the template's own zoom; other views keep their own
+        // size and ignore it.
         Rule rule{name, {ParseView(view)}, kDefaultThreshold};
-        rule.layout.zoom =
-            std::clamp(Wh_GetIntSetting(L"rules[%d].zoom", i), 0, 100);
+        if (view == kCustomZoomView) {
+            rule.layout = CustomZoomLayout(
+                std::clamp(Wh_GetIntSetting(L"rules[%d].zoom", i), 0, 100));
+        }
         // Templates made before thresholds existed read 0 here.
         int threshold = Wh_GetIntSetting(L"rules[%d].threshold", i);
         if (threshold > 0) {
