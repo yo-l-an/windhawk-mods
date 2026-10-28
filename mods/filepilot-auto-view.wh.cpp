@@ -891,12 +891,6 @@ void WaitForUserInputUp() {
     }
 }
 
-void PostAndWait(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    fake_input::Begin();
-    PostMessageW(hwnd, message, wParam, lParam);
-    fake_input::Wait();
-}
-
 // Returns false, sending nothing, once the user has left the folder.
 bool PressHotkey(HWND hwnd,
                  const Hotkey& hotkey,
@@ -907,8 +901,12 @@ bool PressHotkey(HWND hwnd,
     if (!stillCurrent()) {
         return false;
     }
-    PostAndWait(hwnd, down, hotkey.vk, KeyLParam(hotkey, false));
-    PostAndWait(hwnd, up, hotkey.vk, KeyLParam(hotkey, true));
+    // Down and up in one frame: File Pilot still sees the press, and the
+    // preset shows for one frame less.
+    fake_input::Begin();
+    PostMessageW(hwnd, down, hotkey.vk, KeyLParam(hotkey, false));
+    PostMessageW(hwnd, up, hotkey.vk, KeyLParam(hotkey, true));
+    fake_input::Wait();
     return true;
 }
 
@@ -965,6 +963,8 @@ class ViewRecords {
         uintptr_t changed = 0;
         // The title change these were taken at, for WriteZoom.
         unsigned title = 0;
+        // When, in GetTickCount64 milliseconds: for the log.
+        ULONGLONG takenAt = 0;
     };
 
     // Called on every title change, by the UI thread that has just reset the
@@ -1003,9 +1003,10 @@ class ViewRecords {
         }
         seen_ = std::move(records);
         if (currentCount) {
-            return {currentCount == 1 ? current : 0, 0, titles_};
+            return {currentCount == 1 ? current : 0, 0, titles_,
+                    GetTickCount64()};
         }
-        return {0, changedCount == 1 ? changed : 0, titles_};
+        return {0, changedCount == 1 ? changed : 0, titles_, GetTickCount64()};
     }
 
     // The user zoomed (Ctrl+wheel or a View hotkey) since the last title
@@ -1013,6 +1014,15 @@ class ViewRecords {
     void NoteManualZoom() { manualZoom_ = true; }
 
     std::vector<uintptr_t> FindEverywhere() { return Scan(nullptr); }
+
+    std::vector<uintptr_t> FindInKnownRegions() {
+        std::vector<uintptr_t> regions;
+        {
+            std::lock_guard lock(mutex_);
+            regions = regions_;
+        }
+        return Scan(&regions);
+    }
 
     // Remembers the region holding a record, File Pilot's for that tab, and
     // takes its records as seen.
@@ -1212,10 +1222,9 @@ class ViewRecords {
                     ScanRegion(info, buffer, records);
                 }
             }
+            Wh_Log(L"Found %zu view records in %llu ms", records.size(),
+                   GetTickCount64() - startTime);
         }
-        Wh_Log(L"Found %zu view records in %llu ms (%s)", records.size(),
-               GetTickCount64() - startTime,
-               regions ? L"known regions" : L"all memory");
         return records;
     }
 
@@ -1317,10 +1326,10 @@ std::array<View, kViewCount> PresetsByDistance(float zoom) {
 
 using RecordZooms = std::vector<std::pair<uintptr_t, float>>;
 
-// Every view record in memory, with its zoom.
-RecordZooms ZoomsEverywhere() {
+// These view records, with their zooms.
+RecordZooms ZoomsOf(const std::vector<uintptr_t>& records) {
     RecordZooms zooms;
-    for (uintptr_t record : g_viewRecords.FindEverywhere()) {
+    for (uintptr_t record : records) {
         float zoom;
         if (ViewRecords::ReadZoom(record, &zoom)) {
             zooms.push_back({record, zoom});
@@ -1347,24 +1356,34 @@ std::vector<uintptr_t> TookZoom(const RecordZooms& before,
 }
 
 // Waits for a preset press to reach the view records. File Pilot applies it
-// a frame or two later, so the known records are read again until one takes
-// the zoom; then all memory is scanned once more for records that moved.
+// a frame or two later, so the records from before and the known regions are
+// read again until one takes the zoom, which then shows only until the next
+// write. All memory is scanned again only if none does.
 std::vector<uintptr_t> WaitForPreset(const RecordZooms& before, float zoom) {
     constexpr ULONGLONG kWaitMs = 250;
-    constexpr DWORD kPollMs = 10;
+    constexpr DWORD kPollMs = 2;
 
+    std::vector<uintptr_t> addresses;
+    for (const auto& [record, recordZoom] : before) {
+        addresses.push_back(record);
+    }
     ULONGLONG start = GetTickCount64();
-    RecordZooms known = before;
     while (GetTickCount64() - start < kWaitMs) {
-        for (auto& [record, recordZoom] : known) {
-            ViewRecords::ReadZoom(record, &recordZoom);
+        std::vector<uintptr_t> nearby = g_viewRecords.FindInKnownRegions();
+        for (uintptr_t record : addresses) {
+            if (std::find(nearby.begin(), nearby.end(), record) ==
+                nearby.end()) {
+                nearby.push_back(record);
+            }
         }
-        if (!TookZoom(before, known, zoom).empty()) {
-            break;
+        std::vector<uintptr_t> reacted =
+            TookZoom(before, ZoomsOf(nearby), zoom);
+        if (!reacted.empty()) {
+            return reacted;
         }
         Sleep(kPollMs);
     }
-    return TookZoom(before, ZoomsEverywhere(), zoom);
+    return TookZoom(before, ZoomsOf(g_viewRecords.FindEverywhere()), zoom);
 }
 
 // Finds the current folder's record by pressing a view preset and seeing
@@ -1383,7 +1402,7 @@ uintptr_t FindRecordWithPreset(HWND hwnd,
     *alreadyThere = false;
     constexpr int kPresetsTried = 2;
 
-    RecordZooms before = ZoomsEverywhere();
+    RecordZooms before = ZoomsOf(g_viewRecords.FindEverywhere());
     std::array<View, kViewCount> presets = PresetsByDistance(zoom);
     for (int i = 0; i < kPresetsTried; i++) {
         float presetZoom = filepilot::kViewZoom[static_cast<int>(presets[i])];
@@ -1408,7 +1427,8 @@ uintptr_t FindRecordWithPreset(HWND hwnd,
             *alreadyThere = true;
             return 0;
         }
-        before = ZoomsEverywhere();  // the baseline for the next preset
+        // The baseline for the next preset.
+        before = ZoomsOf(g_viewRecords.FindEverywhere());
     }
     Wh_Log(L"Can't tell the view record apart");
     return 0;
@@ -1457,8 +1477,10 @@ bool ApplyThroughRecord(HWND hwnd,
     }
     // Make File Pilot render the new zoom on its next frame.
     InvalidateRect(hwnd, nullptr, FALSE);
-    Wh_Log(L"%s: zoom %g written to the view record at %p", folder.c_str(),
-           zoom, reinterpret_cast<void*>(record));
+    Wh_Log(L"%s: zoom %g written to the view record at %p, %llu ms after "
+           L"the folder opened",
+           folder.c_str(), zoom, reinterpret_cast<void*>(record),
+           GetTickCount64() - changes.takenAt);
     return true;
 }
 
