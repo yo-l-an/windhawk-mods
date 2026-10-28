@@ -897,19 +897,28 @@ void PostAndWait(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     fake_input::Wait();
 }
 
-void PressHotkey(HWND hwnd, const Hotkey& hotkey) {
+// Returns false, sending nothing, once the user has left the folder.
+bool PressHotkey(HWND hwnd,
+                 const Hotkey& hotkey,
+                 const std::function<bool()>& stillCurrent) {
     UINT down = hotkey.alt ? WM_SYSKEYDOWN : WM_KEYDOWN;
     UINT up = hotkey.alt ? WM_SYSKEYUP : WM_KEYUP;
     WaitForUserInputUp();
+    if (!stillCurrent()) {
+        return false;
+    }
     PostAndWait(hwnd, down, hotkey.vk, KeyLParam(hotkey, false));
     PostAndWait(hwnd, up, hotkey.vk, KeyLParam(hotkey, true));
+    return true;
 }
 
 // Sends Ctrl+wheel messages, one per notch (positive zooms in). File Pilot
 // hit-tests the wheel against the previous frame's cursor, so a move to the
 // file list gets a few frames first, and the fake cursor must not lapse in
-// between.
-void WheelZoom(HWND hwnd, int notches) {
+// between. Sends nothing once the user has left the folder.
+void WheelZoom(HWND hwnd,
+               int notches,
+               const std::function<bool()>& stillCurrent) {
     if (notches == 0) {
         return;
     }
@@ -919,6 +928,9 @@ void WheelZoom(HWND hwnd, int notches) {
     SHORT delta = notches > 0 ? WHEEL_DELTA : -WHEEL_DELTA;
 
     WaitForUserInputUp();
+    if (!stillCurrent()) {
+        return;
+    }
     fake_input::Begin();
     PostMessageW(hwnd, WM_MOUSEMOVE, fake_input::kMouseTag,
                  MAKELPARAM(clientPoint.x, clientPoint.y));
@@ -951,6 +963,8 @@ class ViewRecords {
         // current folder's, but a view change in the tab just left changes
         // that tab's record too, so it's only trusted for reading.
         uintptr_t changed = 0;
+        // The title change these were taken at, for WriteZoom.
+        unsigned title = 0;
     };
 
     // Called on every title change, by the UI thread that has just reset the
@@ -959,6 +973,7 @@ class ViewRecords {
     // Never guess past Changes: a wrong record changes another folder's view.
     Changes TakeChanges() {
         std::lock_guard lock(mutex_);
+        titles_++;
         bool manualZoom = manualZoom_.exchange(false);
         std::vector<Seen> records = Snapshot(Scan(&regions_));
         uintptr_t current = 0, changed = 0;
@@ -988,9 +1003,9 @@ class ViewRecords {
         }
         seen_ = std::move(records);
         if (currentCount) {
-            return {currentCount == 1 ? current : 0, 0};
+            return {currentCount == 1 ? current : 0, 0, titles_};
         }
-        return {0, changedCount == 1 ? changed : 0};
+        return {0, changedCount == 1 ? changed : 0, titles_};
     }
 
     // The user zoomed (Ctrl+wheel or a View hotkey) since the last title
@@ -1034,14 +1049,19 @@ class ViewRecords {
     }
 
     // Writes only if the address still holds a view record, checked right
-    // before writing, and only a zoom File Pilot itself can hold. The new
-    // zoom is taken as seen, so it doesn't pass for a navigation.
-    bool WriteZoom(uintptr_t record, float zoom) {
+    // before writing, only a zoom File Pilot itself can hold, and only while
+    // the title is still the one title stands for: TakeChanges runs under the
+    // same lock, so a folder change can't slip in between. The new zoom is
+    // taken as seen, so it doesn't pass for a navigation.
+    bool WriteZoom(uintptr_t record, float zoom, unsigned title) {
         float current;
         if (!(zoom >= 0.0f && zoom <= 1.0f) || !ReadZoom(record, &current)) {
             return false;
         }
         std::lock_guard lock(mutex_);
+        if (title != titles_) {
+            return false;
+        }
         SIZE_T written = 0;
         if (!WriteProcessMemory(GetCurrentProcess(),
                                 reinterpret_cast<LPVOID>(record), &zoom,
@@ -1203,6 +1223,7 @@ class ViewRecords {
     std::vector<uintptr_t> regions_;
     std::vector<Seen> seen_;  // records in the known regions last time
     std::atomic<bool> manualZoom_ = false;
+    unsigned titles_ = 0;  // title changes seen by TakeChanges
 };
 
 ViewRecords g_viewRecords;
@@ -1357,6 +1378,7 @@ std::vector<uintptr_t> WaitForPreset(const RecordZooms& before, float zoom) {
 uintptr_t FindRecordWithPreset(HWND hwnd,
                                const Config& config,
                                float zoom,
+                               const std::function<bool()>& stillCurrent,
                                bool* alreadyThere) {
     *alreadyThere = false;
     constexpr int kPresetsTried = 2;
@@ -1365,9 +1387,16 @@ uintptr_t FindRecordWithPreset(HWND hwnd,
     std::array<View, kViewCount> presets = PresetsByDistance(zoom);
     for (int i = 0; i < kPresetsTried; i++) {
         float presetZoom = filepilot::kViewZoom[static_cast<int>(presets[i])];
-        synth::PressHotkey(hwnd, config.hotkeys[static_cast<int>(presets[i])]);
+        if (!synth::PressHotkey(
+                hwnd, config.hotkeys[static_cast<int>(presets[i])],
+                stillCurrent)) {
+            return 0;
+        }
 
         std::vector<uintptr_t> reacted = WaitForPreset(before, presetZoom);
+        if (!stillCurrent()) {
+            return 0;  // what reacted may be the next folder's
+        }
         if (reacted.size() == 1) {
             return reacted[0];
         }
@@ -1394,7 +1423,8 @@ bool ApplyThroughRecord(HWND hwnd,
                         const Config& config,
                         const std::wstring& folder,
                         const Layout& layout,
-                        const ViewRecords::Changes& changes) {
+                        const ViewRecords::Changes& changes,
+                        const std::function<bool()>& stillCurrent) {
     float zoom = layout.RecordZoom();
     uintptr_t record = changes.current;
     bool alreadyThere =
@@ -1411,7 +1441,8 @@ bool ApplyThroughRecord(HWND hwnd,
     if (!record && !alreadyThere) {
         Wh_Log(L"%s: no current view record, finding it with a preset",
                folder.c_str());
-        record = FindRecordWithPreset(hwnd, config, zoom, &alreadyThere);
+        record = FindRecordWithPreset(hwnd, config, zoom, stillCurrent,
+                                      &alreadyThere);
         if (record) {
             g_viewRecords.RememberRegionOf(record);
             alreadyThere = ViewRecords::HasZoom(record, zoom);
@@ -1421,7 +1452,7 @@ bool ApplyThroughRecord(HWND hwnd,
         Wh_Log(L"%s: already at zoom %g", folder.c_str(), zoom);
         return true;
     }
-    if (!record || !g_viewRecords.WriteZoom(record, zoom)) {
+    if (!record || !g_viewRecords.WriteZoom(record, zoom, changes.title)) {
         return false;
     }
     // Make File Pilot render the new zoom on its next frame.
@@ -1432,26 +1463,43 @@ bool ApplyThroughRecord(HWND hwnd,
 }
 
 // Fallback: Ctrl+wheel up from Details (0%), in whole notches.
-void SetZoomWithWheel(HWND hwnd, const Config& config, int zoom) {
-    synth::PressHotkey(hwnd, config.hotkeys[static_cast<int>(View::Details)]);
-    synth::WheelZoom(
-        hwnd, static_cast<int>(std::lround(zoom / filepilot::kZoomPerWheelMessage)));
+void SetZoomWithWheel(HWND hwnd,
+                      const Config& config,
+                      int zoom,
+                      const std::function<bool()>& stillCurrent) {
+    if (!synth::PressHotkey(hwnd,
+                            config.hotkeys[static_cast<int>(View::Details)],
+                            stillCurrent)) {
+        return;
+    }
+    int notches =
+        static_cast<int>(std::lround(zoom / filepilot::kZoomPerWheelMessage));
+    synth::WheelZoom(hwnd, notches, stillCurrent);
 }
 
+// Every step checks stillCurrent first: once the user has left the folder,
+// nothing more is sent or written.
 void ApplyLayout(HWND hwnd,
                  const Config& config,
                  const std::wstring& folder,
                  const Layout& layout,
-                 const ViewRecords::Changes& recordChanges) {
-    if (ApplyThroughRecord(hwnd, config, folder, layout, recordChanges)) {
+                 const ViewRecords::Changes& recordChanges,
+                 const std::function<bool()>& stillCurrent) {
+    if (ApplyThroughRecord(hwnd, config, folder, layout, recordChanges,
+                           stillCurrent)) {
+        return;
+    }
+    if (!stillCurrent()) {
+        Wh_Log(L"%s: left before its view was applied", folder.c_str());
         return;
     }
     if (layout.HasCustomZoom()) {
         Wh_Log(L"Falling back to Ctrl+wheel zoom");
-        SetZoomWithWheel(hwnd, config, layout.zoom);
+        SetZoomWithWheel(hwnd, config, layout.zoom, stillCurrent);
         return;
     }
-    synth::PressHotkey(hwnd, config.hotkeys[static_cast<int>(layout.view)]);
+    synth::PressHotkey(hwnd, config.hotkeys[static_cast<int>(layout.view)],
+                       stillCurrent);
 }
 
 // Picks and applies the layout for a folder. recordChanges were taken when
@@ -1483,7 +1531,8 @@ void ApplyFolderLayout(const std::wstring& path,
     }
     Wh_Log(L"%s: switching to %s, zoom %d", path.c_str(),
            ViewName(layout.view), layout.zoom);
-    ApplyLayout(hwnd, *config, normalized, layout, recordChanges);
+    ApplyLayout(hwnd, *config, normalized, layout, recordChanges,
+                stillCurrent);
 }
 
 // ===========================================================================
