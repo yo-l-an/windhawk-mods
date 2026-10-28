@@ -872,17 +872,20 @@ LPARAM KeyLParam(const Hotkey& hotkey, bool up) {
     return lParam;
 }
 
-// Waits until the user lets go of modifier keys, such as the Alt of Alt+Left:
-// File Pilot reads them with ours, and ignores a hotkey with an extra one.
-void WaitForModifiersUp() {
-    constexpr int kModifiers[] = {VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN,
-                                  VK_RWIN};
+// Waits until the user lets go of the keys and buttons that opened the folder:
+// File Pilot reads modifiers such as the Alt of Alt+Left with ours, and ignores
+// a hotkey with an extra one, or any hotkey while a mouse button is down, such
+// as the second click of a double-click.
+void WaitForUserInputUp() {
+    constexpr int kKeys[] = {VK_SHIFT,   VK_CONTROL, VK_MENU,     VK_LWIN,
+                             VK_RWIN,    VK_LBUTTON, VK_RBUTTON,  VK_MBUTTON,
+                             VK_XBUTTON1, VK_XBUTTON2};
     constexpr ULONGLONG kMaxWaitMs = 2000;
     constexpr DWORD kPollMs = 10;
 
     ULONGLONG start = GetTickCount64();
     while (GetTickCount64() - start < kMaxWaitMs &&
-           std::any_of(std::begin(kModifiers), std::end(kModifiers),
+           std::any_of(std::begin(kKeys), std::end(kKeys),
                        [](int vk) { return GetAsyncKeyState(vk) & 0x8000; })) {
         Sleep(kPollMs);
     }
@@ -897,7 +900,7 @@ void PostAndWait(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
 void PressHotkey(HWND hwnd, const Hotkey& hotkey) {
     UINT down = hotkey.alt ? WM_SYSKEYDOWN : WM_KEYDOWN;
     UINT up = hotkey.alt ? WM_SYSKEYUP : WM_KEYUP;
-    WaitForModifiersUp();
+    WaitForUserInputUp();
     PostAndWait(hwnd, down, hotkey.vk, KeyLParam(hotkey, false));
     PostAndWait(hwnd, up, hotkey.vk, KeyLParam(hotkey, true));
 }
@@ -915,7 +918,7 @@ void WheelZoom(HWND hwnd, int notches) {
     ScreenToClient(hwnd, &clientPoint);
     SHORT delta = notches > 0 ? WHEEL_DELTA : -WHEEL_DELTA;
 
-    WaitForModifiersUp();
+    WaitForUserInputUp();
     fake_input::Begin();
     PostMessageW(hwnd, WM_MOUSEMOVE, fake_input::kMouseTag,
                  MAKELPARAM(clientPoint.x, clientPoint.y));
