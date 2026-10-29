@@ -20,14 +20,15 @@ suits what's inside, like Windows Explorer does for picture folders.
 
 ## How folders are matched
 Each folder you open is matched against templates, by file type. These are
-the default templates: in Settings you can change them, add your own, or
-remove any.
+the default templates: in Settings you can change them, turn them on or off,
+add your own, or remove any.
 
-| Template | View |
-|---|---|
-| Images | Medium icons at 45% |
-| Videos | Medium icons at 45% |
-| Documents | Tree |
+| Template | File types | View | On by default |
+|---|---|---|---|
+| Medias | Images, videos, PDF and slides | Icons at 50% | Yes |
+| Images | Images | Icons at 50% | No |
+| Videos | Videos | Icons at 50% | No |
+| Documents | PDF, office documents, text | Tree | No |
 
 - A template wins when its file types make up at least 60% of the folder's
   files. If several qualify, the one with the most files wins.
@@ -53,7 +54,7 @@ the number of items read, and folders to leave alone.
 - A new tab on the same folder (Ctrl+T) shows File Pilot's default view until
   you open another folder.
 - When the mod can't set the zoom directly, it zooms the way Ctrl+scroll does,
-  in 5.5% steps, so 45% becomes 44%.
+  in 5.5% steps, so 50% becomes 49.5%.
 
 ## Compatibility
 Tested with File Pilot 0.8.5 on Windows 10.
@@ -72,9 +73,11 @@ File Pilot back to normal, and check for a mod update.
 // ==WindhawkModSettings==
 /*
 - rules:
-  - - name: Images
+  - - name: Medias
       $name: Name
-    - extensions: jpg jpeg jfif png gif webp bmp tif tiff heic heif avif svg ico psd raw dng cr2 cr3 nef arw orf rw2
+    - enabled: true
+      $name: Enabled
+    - extensions: jpg jpeg jfif png gif webp bmp tif tiff heic heif avif svg ico psd raw dng cr2 cr3 nef arw orf rw2 mp4 mkv mov avi webm wmv m4v flv mpg mpeg ts mts m2ts 3gp pdf ppt pptx
       $name: Extensions
       $description: Separated by spaces or commas, without dots
     - view: custom
@@ -87,7 +90,7 @@ File Pilot back to normal, and check for a mod update.
       - large: Large icons
       - xl: Extra large icons
       - custom: Custom zoom
-    - zoom: 45
+    - zoom: 50
       $name: Custom zoom (%)
       $description: >-
         Used when View is Custom zoom, from 0 to 100. Below 30, File Pilot only
@@ -95,15 +98,23 @@ File Pilot back to normal, and check for a mod update.
     - threshold: 60
       $name: Match threshold (%)
       $description: Share of the folder's files these extensions must reach
+  - - name: Images
+    - enabled: false
+    - extensions: jpg jpeg jfif png gif webp bmp tif tiff heic heif avif svg ico psd raw dng cr2 cr3 nef arw orf rw2
+    - view: custom
+    - zoom: 50
+    - threshold: 60
   - - name: Videos
+    - enabled: false
     - extensions: mp4 mkv mov avi webm wmv m4v flv mpg mpeg ts mts m2ts 3gp
     - view: custom
-    - zoom: 45
+    - zoom: 50
     - threshold: 60
   - - name: Documents
+    - enabled: false
     - extensions: pdf doc docx xls xlsx ppt pptx odt ods odp rtf txt md csv epub
     - view: tree
-    - zoom: 45
+    - zoom: 50
     - threshold: 60
   $name: Templates
   $description: >-
@@ -408,6 +419,9 @@ void LoadRules(Config& config) {
             text::TakeSetting(Wh_GetStringSetting(L"rules[%d].view", i));
         if (name.empty() && extensions.empty() && view.empty()) {
             break;
+        }
+        if (!Wh_GetIntSetting(L"rules[%d].enabled", i)) {
+            continue;  // kept as an example
         }
 
         // "custom" is the template's own zoom; other views keep their own
