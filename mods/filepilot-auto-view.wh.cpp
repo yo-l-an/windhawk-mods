@@ -31,7 +31,8 @@ add your own, or remove any.
 | Documents | PDF, office documents, text | Tree | No |
 
 - A template wins when its file types make up at least 60% of the folder's
-  files. If several qualify, the one with the most files wins.
+  items, subfolders included. If several qualify, the one with the most
+  files wins.
 - Mixed folders, and folders holding only subfolders, keep the view File
   Pilot saved for them.
 - The mod reads the first 2000 items of a folder, which keeps large folders
@@ -97,25 +98,33 @@ File Pilot back to normal, and check for a mod update.
         has Details (0), Tree (10) and List (20), and rounds up to the next one
     - threshold: 60
       $name: Match threshold (%)
-      $description: Share of the folder's files these extensions must reach
+      $description: Share of the folder's items these extensions must reach
+    - countFolders: true
+      $name: Count folders
+      $description: >-
+        Subfolders count as items too, so a folder with many subfolders needs
+        more matching files to reach the threshold
   - - name: Images
     - enabled: false
     - extensions: jpg jpeg jfif png gif webp bmp tif tiff heic heif avif svg ico psd raw dng cr2 cr3 nef arw orf rw2
     - view: custom
     - zoom: 50
     - threshold: 60
+    - countFolders: true
   - - name: Videos
     - enabled: false
     - extensions: mp4 mkv mov avi webm wmv m4v flv mpg mpeg ts mts m2ts 3gp
     - view: custom
     - zoom: 50
     - threshold: 60
+    - countFolders: true
   - - name: Documents
     - enabled: false
     - extensions: pdf doc docx xls xlsx ppt pptx odt ods odp rtf txt md csv epub
     - view: tree
     - zoom: 50
     - threshold: 60
+    - countFolders: true
   $name: Templates
   $description: >-
     A template applies when its extensions make up at least its threshold share
@@ -356,7 +365,8 @@ struct Layout {
 struct Rule {
     std::wstring name;
     Layout layout;
-    int threshold = 0;  // percent of the folder's files
+    int threshold = 0;  // percent of the folder's items
+    bool countFolders = true;  // subfolders are items too
 };
 
 // A settings snapshot. It is never modified once published, so threads keep
@@ -436,6 +446,7 @@ void LoadRules(Config& config) {
         if (threshold > 0) {
             rule.threshold = std::min(threshold, 100);
         }
+        rule.countFolders = Wh_GetIntSetting(L"rules[%d].countFolders", i);
         if (rule.layout.view == View::None) {
             continue;
         }
@@ -1358,17 +1369,21 @@ Layout ClassifyFolder(const std::wstring& path, const Config& config) {
     // Among templates reaching their own threshold, the most files wins.
     size_t best = counts.size();
     for (size_t i = 0; i < counts.size(); i++) {
-        bool qualifies = counts[i] * 100 >= config.rules[i].threshold * files;
+        const Rule& rule = config.rules[i];
+        int items = files + (rule.countFolders ? folders : 0);
+        bool qualifies = counts[i] * 100 >= rule.threshold * items;
         if (qualifies && (best == counts.size() || counts[i] > counts[best])) {
             best = i;
         }
     }
     if (best == counts.size()) {
-        Wh_Log(L"%s: mixed (%d files)", path.c_str(), files);
+        Wh_Log(L"%s: mixed (%d files, %d folders)", path.c_str(), files,
+               folders);
         return {config.mixedView};
     }
-    Wh_Log(L"%s: %d/%d files match %s", path.c_str(), counts[best], files,
-           config.rules[best].name.c_str());
+    Wh_Log(L"%s: %d files match %s, with %d files and %d folders",
+           path.c_str(), counts[best], config.rules[best].name.c_str(), files,
+           folders);
     return config.rules[best].layout;
 }
 
