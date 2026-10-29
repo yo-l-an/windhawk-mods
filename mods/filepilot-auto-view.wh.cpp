@@ -1081,10 +1081,46 @@ class ViewRecords {
         return true;
     }
 
-    static bool HasZoom(uintptr_t record, float zoom) {
+    // Whether the record's zoom is within kNearZoom of this one: close enough
+    // that switching would only flash the view for a change hard to see.
+    static bool IsNear(uintptr_t record, float zoom) {
+        constexpr float kNearZoom = 0.02f;
         float current;
         return ReadZoom(record, &current) &&
-               std::fabs(current - zoom) < filepilot::kZoomTolerance;
+               std::fabs(current - zoom) <= kNearZoom;
+    }
+
+    // Notes the folder a record's tab shows, once the record is known to be
+    // the current folder's, so going back to that tab can be read without a
+    // preset.
+    void NoteFolder(uintptr_t record, const std::wstring& folder) {
+        MEMORY_BASIC_INFORMATION info;
+        if (!VirtualQuery(reinterpret_cast<LPCVOID>(record), &info,
+                          sizeof(info))) {
+            return;
+        }
+        uintptr_t region = reinterpret_cast<uintptr_t>(info.BaseAddress);
+        std::lock_guard lock(mutex_);
+        shown_[region] = folder;
+    }
+
+    // The record of the known tab last noted showing this folder, or 0 when
+    // none or several tabs did, or its region holds other records too.
+    uintptr_t RecordShowing(const std::wstring& folder) {
+        std::vector<uintptr_t> regions;
+        {
+            std::lock_guard lock(mutex_);
+            for (const auto& [region, shown] : shown_) {
+                if (shown == folder) {
+                    regions.push_back(region);
+                }
+            }
+        }
+        if (regions.size() != 1) {
+            return 0;
+        }
+        std::vector<uintptr_t> records = Scan(&regions);
+        return records.size() == 1 ? records[0] : 0;
     }
 
     // Writes only if the address still holds a view record, checked right
@@ -1262,6 +1298,7 @@ class ViewRecords {
     std::vector<Seen> seen_;  // records in the known regions last time
     std::atomic<bool> manualZoom_ = false;
     unsigned titles_ = 0;  // title changes seen by TakeChanges
+    std::unordered_map<uintptr_t, std::wstring> shown_;  // folder by region
 };
 
 ViewRecords g_viewRecords;
@@ -1479,8 +1516,14 @@ bool ApplyThroughRecord(HWND hwnd,
     float zoom = layout.RecordZoom();
     uintptr_t record = changes.current;
     bool alreadyThere =
-        record ? ViewRecords::HasZoom(record, zoom)
-               : changes.changed && ViewRecords::HasZoom(changes.changed, zoom);
+        record ? ViewRecords::IsNear(record, zoom)
+               : changes.changed && ViewRecords::IsNear(changes.changed, zoom);
+    // Back on a tab the mod set this folder in: its record can be read.
+    uintptr_t shown =
+        record || alreadyThere ? 0 : g_viewRecords.RecordShowing(folder);
+    if (shown && ViewRecords::IsNear(shown, zoom)) {
+        alreadyThere = true;
+    }
     // Navigations and new tabs start from the default view, so a folder
     // with no record to read is already there.
     float defaultZoom;
@@ -1496,7 +1539,8 @@ bool ApplyThroughRecord(HWND hwnd,
                                       &alreadyThere);
         if (record) {
             g_viewRecords.RememberRegionOf(record);
-            alreadyThere = ViewRecords::HasZoom(record, zoom);
+            g_viewRecords.NoteFolder(record, folder);
+            alreadyThere = ViewRecords::IsNear(record, zoom);
         }
     }
     if (alreadyThere) {
@@ -1562,6 +1606,9 @@ void ApplyFolderLayout(const std::wstring& path,
                        const std::function<bool()>& stillCurrent) {
     std::shared_ptr<const Config> config = config::Current();
     std::wstring normalized = text::NormalizePath(path);
+    if (recordChanges.current) {
+        g_viewRecords.NoteFolder(recordChanges.current, normalized);
+    }
     if (config->IsExcluded(normalized)) {
         return;
     }
