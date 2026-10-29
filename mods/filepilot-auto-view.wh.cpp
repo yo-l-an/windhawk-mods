@@ -1321,8 +1321,10 @@ Layout ClassifyFolder(const std::wstring& path, const Config& config) {
     return config.rules[best].layout;
 }
 
-// Presets from nearest to farthest from this zoom.
-std::array<View, kViewCount> PresetsByDistance(float zoom) {
+// Presets in the order they're tried: the nearest at or below this zoom
+// first, so the view only grows into place, then the others from nearest to
+// farthest.
+std::array<View, kViewCount> PresetsToTry(float zoom) {
     std::array<View, kViewCount> presets;
     for (int i = 0; i < kViewCount; i++) {
         presets[i] = static_cast<View>(i);
@@ -1331,6 +1333,11 @@ std::array<View, kViewCount> PresetsByDistance(float zoom) {
         return std::fabs(filepilot::kViewZoom[static_cast<int>(a)] - zoom) <
                std::fabs(filepilot::kViewZoom[static_cast<int>(b)] - zoom);
     });
+    auto below = std::find_if(presets.begin(), presets.end(), [zoom](View v) {
+        return filepilot::kViewZoom[static_cast<int>(v)] <=
+               zoom + filepilot::kZoomTolerance;
+    });
+    std::rotate(presets.begin(), below, below + 1);
     return presets;
 }
 
@@ -1400,7 +1407,7 @@ std::vector<uintptr_t> WaitForPreset(const RecordZooms& before, float zoom) {
 // which record, in all memory, takes its zoom. File Pilot shows its view
 // popover for a moment, so this is only for when TakeChanges finds no current
 // record.
-// A folder already at the nearest preset doesn't react to it: when that
+// A folder already at the first preset doesn't react to it: when that
 // preset is the zoom wanted, there's nothing left to do and *alreadyThere is
 // set, else the next preset is tried. Returns 0 unless exactly one record
 // reacts.
@@ -1413,7 +1420,7 @@ uintptr_t FindRecordWithPreset(HWND hwnd,
     constexpr int kPresetsTried = 2;
 
     RecordZooms before = ZoomsOf(g_viewRecords.FindEverywhere());
-    std::array<View, kViewCount> presets = PresetsByDistance(zoom);
+    std::array<View, kViewCount> presets = PresetsToTry(zoom);
     for (int i = 0; i < kPresetsTried; i++) {
         float presetZoom = filepilot::kViewZoom[static_cast<int>(presets[i])];
         if (!synth::PressHotkey(
