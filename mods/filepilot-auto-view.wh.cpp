@@ -78,7 +78,7 @@ File Pilot back to normal, and check for a mod update.
       $name: Name
     - enabled: true
       $name: Enabled
-    - extensions: jpg jpeg jfif png gif webp bmp tif tiff heic heif avif svg ico psd raw dng cr2 cr3 nef arw orf rw2 mp4 mkv mov avi webm wmv m4v flv mpg mpeg ts mts m2ts 3gp pdf ppt pptx
+    - extensions: jpg jpeg jfif png gif webp bmp tif tiff heic heif avif svg ico psd raw dng cr2 cr3 nef arw orf rw2 mp4 mkv mov avi webm wmv m4v flv mpg mpeg ts mts m2ts 3gp sfk pdf ppt pptx
       $name: Extensions
       $description: Separated by spaces or commas, without dots
     - view: custom
@@ -113,7 +113,7 @@ File Pilot back to normal, and check for a mod update.
     - countFolders: true
   - - name: Videos
     - enabled: false
-    - extensions: mp4 mkv mov avi webm wmv m4v flv mpg mpeg ts mts m2ts 3gp
+    - extensions: mp4 mkv mov avi webm wmv m4v flv mpg mpeg ts mts m2ts 3gp sfk
     - view: custom
     - zoom: 50
     - threshold: 60
